@@ -1,0 +1,36 @@
+{
+  "dataset_version": "2026-09-30-v1",
+  "prompt_version": "gateway-default-v1",
+  "cases": [
+    {
+      "case_id": "exact-ready-response",
+      "task_type": "simple",
+      "message": "Reply with exactly the single word READY.",
+      "model_preference": "balanced",
+      "max_tokens": 16,
+      "expected": {
+        "allowed_answers": ["READY"],
+        "answer_points": ["READY"],
+        "expected_fields": null,
+        "expected_sources": []
+      },
+      "allowed_answer_variation": "case-insensitive exact match",
+      "known_failure_category": "instruction_following"
+    },
+    {
+      "case_id": "positive-sentiment-json",
+      "task_type": "simple",
+      "message": "Classify the sentiment of 'I love this product.' Return only JSON with a sentiment field set to positive.",
+      "model_preference": "balanced",
+      "max_tokens": 64,
+      "expected": {
+        "allowed_answers": [],
+        "answer_points": ["positive"],
+        "expected_fields": {"sentiment": "positive"},
+        "expected_sources": []
+      },
+      "allowed_answer_variation": "JSON whitespace and key order may vary",
+      "known_failure_category": "structured_output"
+    }
+  ]
+}

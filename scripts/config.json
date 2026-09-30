@@ -1,0 +1,24 @@
+{
+  "provider": "ollama",
+  "fallback_provider": "ollama",
+  "ollama_host": "http://localhost:11434",
+  "model_preferences": {
+    "fast": {
+      "ollama": "smollm2:135m",
+      "openai": "gpt-5.5"
+    },
+    "balanced": {
+      "ollama": "llama3.1:8b",
+      "openai": "gpt-6.0"
+    }
+  },
+  "llm_timeout_seconds": 30,
+  "request_deadline_seconds": 45.0,
+  "max_llm_attempts": 3,
+  "retry_base_delay_seconds": 0.25,
+  "model_pricing_usd_per_million_tokens": {
+    "gpt-5.5": {
+        "input": 5.0,
+        "output": 30.0
+    } }
+}

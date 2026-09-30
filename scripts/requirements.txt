@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+ollama
+openai
+prometheus-client>=0.22
