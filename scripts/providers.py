@@ -1,82 +1,45 @@
 import asyncio
 import hashlib
 from collections.abc import Awaitable
-from dataclasses import dataclass
-from typing import Protocol, TypeVar
-
+from typing import TypeVar
 from ollama import AsyncClient, ResponseError
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
-from scripts.config import (
+from scripts.load_settings import (
     LLM_PROVIDER,
     MODEL_PREFERENCES,
     MODEL_PRICING_USD_PER_MILLION_TOKENS,
     OLLAMA_HOST,
 )
+from scripts.contracts import (
+    GenerationResult,
+    PermanentProviderError,
+    RetryableProviderError,
+    Provider,
+)
 
 T = TypeVar("T")
 
 
+# Bounds one asynchronous operation and raises a timeout if it does not finish in time.
 async def run_with_attempt_timeout(awaitable: Awaitable[T], timeout: float) -> T:
     return await asyncio.wait_for(awaitable, timeout=timeout)
 
 
-class RetryableProviderError(Exception):
-    """A transient provider failure that may succeed on a later attempt."""
-
-    def __init__(
-		self,
-		message: str,
-		attempts: int = 1,
-		outcome_unknown: bool = False,
-        failure_type: str = "provider_error",
-        status_code: int = 0,
-        provider: str | None = None,
-        model: str | None = None,
-	) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-        self.outcome_unknown = outcome_unknown
-        self.failure_type = failure_type
-        self.status_code = status_code
-        self.provider = provider
-        self.model = model
-
-
-class ProviderOutcomeUnknown(Exception):
-    """The provider may have completed the request but its response was lost."""
-
-    def __init__(self, message: str, attempts: int = 1) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-
-
-class PermanentProviderError(Exception):
-    """The provider explicitly rejected a request that should not be retried."""
-
-    def __init__(self, message: str, attempts: int = 1) -> None:
-        super().__init__(message)
-        self.attempts = attempts
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 
+# Checks whether the HTTP status belongs to the configured transient-error set.
 def is_retryable_status_code(status_code: int) -> bool:
     return status_code in RETRYABLE_STATUS_CODES
 
 
-@dataclass(frozen=True)
-class GenerationResult:
-    content: str
-    model: str
-    attempts: int = 1
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    estimated_cost_usd: float | None = None
-    provider: str | None = None
 
 
+
+# Estimates token cost from per-million rates, or returns None when pricing or usage is missing.
 def estimate_cost_usd(
     model: str,
     input_tokens: int | None,
@@ -90,24 +53,15 @@ def estimate_cost_usd(
     ) / 1_000_000
 
 
-class Provider(Protocol):
-    async def complete(
-        self,
-        request_id: str,
-        attempt: int,
-        message: str,
-        model_preference: str,
-        max_tokens: int,
-        timeout: float,
-    ) -> GenerationResult:
-        ...
 
-
+# Calls Ollama, enforces attempt timeouts, classifies errors, and normalizes responses.
 class OllamaProvider:
+    # Initializes the Ollama client and preference-to-model mapping.
     def __init__(self, host: str, models: dict[str, str]) -> None:
         self.client = AsyncClient(host=host)
         self.models = models
 
+    # Calls the selected Ollama model, translates errors, and returns normalized text and usage.
     async def complete(
         self,
         request_id: str,
@@ -128,6 +82,7 @@ class OllamaProvider:
                 timeout,
             )
         except asyncio.TimeoutError as exc:
+            # The response did not arrive in time; remote generation may still have completed.
             raise RetryableProviderError(
 				"Ollama request failed transiently",
 				outcome_unknown=True,
@@ -136,6 +91,7 @@ class OllamaProvider:
                 model=model,
 			) from exc
         except ConnectionError as exc:
+            # Treat connection failures as retryable while retaining uncertainty about remote completion.
             raise RetryableProviderError(
 				"Ollama connection failed",
 				outcome_unknown=True,
@@ -144,6 +100,7 @@ class OllamaProvider:
                 model=model,
 			) from exc
         except ResponseError as exc:
+            # Translate transient HTTP statuses into retryable errors; only 429 is treated as a definite rejection here.
             if is_retryable_status_code(exc.status_code):
                 raise RetryableProviderError(
                     f"Ollama returned retryable status {exc.status_code}",
@@ -165,11 +122,14 @@ class OllamaProvider:
         )
 
 
+# Calls OpenAI Responses with tracing headers, timeout handling, and token-cost estimates.
 class OpenAIProvider:
+    # Initializes OpenAI model mappings and disables SDK retries so the gateway owns the retry budget.
     def __init__(self, models: dict[str, str]) -> None:
         self.client = AsyncOpenAI(max_retries=0)
         self.models = models
 
+    # Calls OpenAI Responses with attempt tracing and returns normalized output, usage, and estimated cost.
     async def complete(
         self,
         request_id: str,
@@ -200,6 +160,7 @@ class OpenAIProvider:
                 timeout,
             )
         except (APITimeoutError, asyncio.TimeoutError) as exc:
+            # Normalize SDK and local timeouts as transient failures with uncertain completion.
             raise RetryableProviderError(
 				"OpenAI request failed transiently",
 				outcome_unknown=True,
@@ -208,6 +169,7 @@ class OpenAIProvider:
                 model=model,
 			) from exc
         except APIConnectionError as exc:
+            # Normalize transport failures while preserving the possibility of remote completion.
             raise RetryableProviderError(
                 "OpenAI connection failed",
                 outcome_unknown=True,
@@ -216,6 +178,7 @@ class OpenAIProvider:
                 model=model,
             ) from exc
         except APIStatusError as exc:
+            # Translate configured transient statuses into retryable errors and other statuses into permanent rejections.
             if is_retryable_status_code(exc.status_code):
                 raise RetryableProviderError(
                     f"OpenAI returned retryable status {exc.status_code}",
@@ -245,7 +208,9 @@ class OpenAIProvider:
         )
 
 
+# Returns predictable text without a network call for isolated development and evaluation.
 class FakeProvider:
+    # Returns deterministic text and model identity without contacting an external provider.
     async def complete(
         self,
         request_id: str,
@@ -262,6 +227,7 @@ class FakeProvider:
         )
 
 
+# Builds the selected provider adapter from configuration or rejects an unsupported provider name.
 def create_provider(provider_name: str | None = None) -> Provider:
     selected_provider = (provider_name or LLM_PROVIDER).lower()
     models_by_provider = {

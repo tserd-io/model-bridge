@@ -20,5 +20,7 @@
     "gpt-5.5": {
         "input": 5.0,
         "output": 30.0
-    } }
+    } },
+  "rate_limit_requests": 3,
+  "rate_limit_window_seconds": 10
 }

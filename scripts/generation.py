@@ -1,53 +1,96 @@
 import asyncio
-import time
 import random
+import time
 from dataclasses import replace
 
-from scripts.config import (
-    DEFAULT_LLM_TIMEOUT_SECONDS,
-    FALLBACK_PROVIDER,
-    LLM_PROVIDER,
-    MAX_LLM_ATTEMPTS,
-    MODEL_PREFERENCES,
-    REQUEST_DEADLINE_SECONDS,
-    RETRY_BASE_DELAY_SECONDS,
-)
+from scripts.load_settings import MODEL_PREFERENCES
 from scripts.observability import (
     log_event,
     record_fallback,
     record_provider_attempt,
 )
-from scripts.providers import create_provider
-from scripts.providers import GenerationResult, ProviderOutcomeUnknown, RetryableProviderError
-provider = create_provider()
-fallback_provider = create_provider(FALLBACK_PROVIDER) if FALLBACK_PROVIDER else None
+from scripts.contracts import (
+    GenerationResult,
+    PermanentProviderError,
+    Provider,
+    ProviderOutcomeUnknown,
+    RetryableProviderError,
+)
 
+async def complete_attempt(
+    provider: Provider,
+    *,
+    request_id: str,
+    attempt: int,
+    message: str,
+    model_preference: str,
+    max_tokens: int,
+    timeout: float,
+) -> GenerationResult:
+    """Convert raw timeouts into the gateway's standard transient error."""
+    try:
+        return await provider.complete(
+            request_id=request_id,
+            attempt=attempt,
+            message=message,
+            model_preference=model_preference,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RetryableProviderError(
+            "Provider call timed out",
+            attempts=attempt,
+            outcome_unknown=True,
+            failure_type="timeout",
+        ) from exc
+#def create_app():
+# Coordinates generation attempts, deadlines, backoff, and a bounded provider fallback.
 async def llm_call(
     request_id: str,
     message: str,
     model_preference: str,
     max_tokens: int,
+    *,
+    provider: Provider,
+    provider_name: str,
+    fallback_provider: Provider | None = None,
+    fallback_provider_name: str | None = None,
     route: str = "default",
     tenant_id: str = "default",
-    timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS,
-    request_deadline_seconds: float = REQUEST_DEADLINE_SECONDS,
-    max_attempts: int = MAX_LLM_ATTEMPTS,
-    retry_base_delay_seconds: float = RETRY_BASE_DELAY_SECONDS,
+    timeout_seconds: float = 30,
+    request_deadline_seconds: float = 45,
+    max_attempts: int = 3,
+    retry_base_delay_seconds: float = 0.25,
 ) -> GenerationResult:
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
-
+    if fallback_provider is not None and not fallback_provider_name:
+        raise ValueError(
+            "fallback_provider_name is required when a fallback provider is supplied"
+        )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + request_deadline_seconds
     last_error: Exception | None = None
     active_provider = provider
-    active_provider_name = LLM_PROVIDER
+    active_provider_name = provider_name
     fallback_used = False
+    any_outcome_unknown = False
+
+    # Preserves completed attempt count and earlier uncertainty when no retry time remains.
+    def deadline_error(attempts: int) -> RetryableProviderError:
+        
+        return RetryableProviderError(
+            "The request deadline leaves no time for another attempt",
+            attempts=attempts,
+            outcome_unknown=any_outcome_unknown,
+            failure_type="deadline_exceeded",
+        )
 
     for attempt in range(1, max_attempts + 1):
         remaining_seconds = deadline - loop.time()
         if remaining_seconds <= 0:
-            raise asyncio.TimeoutError("LLM request deadline expired") from last_error
+            raise deadline_error(attempt - 1) from last_error
 
         attempt_timeout = min(timeout_seconds, remaining_seconds)
         attempt_started = time.perf_counter()
@@ -64,15 +107,17 @@ async def llm_call(
             timeout_ms=round(attempt_timeout * 1000),
         )
         try:
-            result = await active_provider.complete(
+            result = await complete_attempt(
+                active_provider,
                 request_id=request_id,
                 attempt=attempt,
                 message=message,
                 model_preference=model_preference,
                 max_tokens=max_tokens,
                 timeout=attempt_timeout,
-            )
+                )
         except ProviderOutcomeUnknown as exc:
+            # Stop further attempts because completion is explicitly uncertain; preserve the attempt count.
             _record_attempt(
                 request_id,
                 active_provider_name,
@@ -87,6 +132,7 @@ async def llm_call(
             )
             raise ProviderOutcomeUnknown(str(exc), attempts=attempt) from exc
         except RetryableProviderError as exc:
+            # Accumulate uncertainty, check the remaining budgets, then select fallback or back off.
             _record_attempt(
                 request_id,
                 active_provider_name,
@@ -99,7 +145,23 @@ async def llm_call(
                 tenant=tenant_id,
                 status_code=exc.status_code,
             )
+            
             last_error = exc
+            any_outcome_unknown = (any_outcome_unknown or exc.outcome_unknown)
+            attempts_exhausted = attempt >= max_attempts
+            deadline_expired = loop.time() >= deadline
+            if deadline_expired:
+                raise deadline_error(attempt) from exc
+            if attempts_exhausted:
+                raise RetryableProviderError(
+                    str(exc),
+                    attempts=attempt,
+                    outcome_unknown=any_outcome_unknown,
+                    failure_type=exc.failure_type,
+                    status_code=exc.status_code,
+                    provider=active_provider_name,
+                    model=model_name,
+                ) from exc
             if fallback_provider is not None and not fallback_used:
                 active_model = _metric_model(active_provider_name, model_preference)
                 record_fallback(
@@ -110,13 +172,13 @@ async def llm_call(
                     tenant_id,
                     exc.failure_type,
                     exc.status_code,
-                    FALLBACK_PROVIDER,
+                    fallback_provider_name,
                 )
                 log_event(
                     "provider_fallback_selected",
                     request_id=request_id,
                     provider_from=active_provider_name,
-                    provider_to=FALLBACK_PROVIDER,
+                    provider_to=fallback_provider_name,
                     route=route,
                     tenant=tenant_id,
                     attempt=attempt + 1,
@@ -124,88 +186,43 @@ async def llm_call(
                     status_code=exc.status_code,
                 )
                 active_provider = fallback_provider
-                active_provider_name = FALLBACK_PROVIDER
+                active_provider_name = fallback_provider_name
                 fallback_used = True
                 continue
-            if attempt == max_attempts:
-                raise RetryableProviderError(
-					str(exc),
-					attempts=attempt,
-					outcome_unknown=exc.outcome_unknown,
-                    failure_type=exc.failure_type,
-                    status_code=exc.status_code,
-                    provider=active_provider_name,
-                    model=model_name,
-				) from exc
 
             remaining_seconds = deadline - loop.time()
             backoff_cap = retry_base_delay_seconds * (2 ** (attempt - 1))
             delay_seconds = random.uniform(0, backoff_cap)
             if delay_seconds >= remaining_seconds:
-                raise asyncio.TimeoutError("LLM request deadline expired") from exc
+                raise deadline_error(attempt) from exc
             await asyncio.sleep(delay_seconds)
-        except asyncio.TimeoutError as exc:
-            wrapped_error = RetryableProviderError(
-                "Provider call timed out",
-                attempts=attempt,
-                outcome_unknown=True,
-            )
+        except PermanentProviderError as exc:
+            # Stop retrying a definite rejection without erasing uncertainty from earlier attempts.
             _record_attempt(
                 request_id,
                 active_provider_name,
                 attempt,
-                "retryable_error",
+                "error",
                 attempt_started,
                 model=model_name,
-                error=wrapped_error,
+                error=exc,
                 route=route,
                 tenant=tenant_id,
                 status_code=0,
             )
-            last_error = wrapped_error
-            if fallback_provider is not None and not fallback_used:
-                active_model = _metric_model(active_provider_name, model_preference)
-                record_fallback(
-                    request_id,
-                    active_provider_name,
-                    active_model,
-                    route,
-                    tenant_id,
-                    "timeout",
-                    0,
-                    FALLBACK_PROVIDER,
-                )
-                log_event(
-					"provider_fallback_selected",
-					request_id=request_id,
-					provider_from=active_provider_name,
-					provider_to=FALLBACK_PROVIDER,
-                    route=route,
-                    tenant=tenant_id,
-					attempt=attempt + 1,
-					error_type=type(exc).__name__,
-                    status_code=0,
-				)
-                active_provider = fallback_provider
-                active_provider_name = FALLBACK_PROVIDER
-                fallback_used = True
-                continue
-            if attempt == max_attempts:
-                raise RetryableProviderError(
-                    str(wrapped_error),
+
+            if any_outcome_unknown:
+                raise ProviderOutcomeUnknown(
+                    "An earlier provider attempt may have completed",
                     attempts=attempt,
-                    outcome_unknown=True,
-                    failure_type="timeout",
-                    provider=active_provider_name,
-                    model=model_name,
                 ) from exc
-            remaining_seconds = deadline - loop.time()
-            backoff_cap = retry_base_delay_seconds * (2 ** (attempt - 1))
-            delay_seconds = random.uniform(0, backoff_cap)
-            if delay_seconds >= remaining_seconds:
-                raise asyncio.TimeoutError("LLM request deadline expired") from exc
-            await asyncio.sleep(delay_seconds)
+
+            raise PermanentProviderError(
+                str(exc),
+                attempts=attempt,
+            ) from exc
         except Exception as exc:
+            # Record unexpected failures and propagate them to the API outcome handler.
             _record_attempt(
 				request_id,
 				active_provider_name,
@@ -240,6 +257,7 @@ async def llm_call(
     raise RuntimeError("LLM call ended without a result")
 
 
+# Records the duration, outcome, and correlation details of one provider attempt.
 def _record_attempt(
     request_id: str,
     provider_name: str,
@@ -286,6 +304,7 @@ def _record_attempt(
     )
 
 
+# Resolves a configured model name for metrics, including fake and unknown providers.
 def _metric_model(provider_name: str, model_preference: str) -> str:
     if provider_name == "fake":
         return f"fake-{model_preference}"

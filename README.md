@@ -26,7 +26,7 @@ The evaluation runner sends a versioned set of prompts through the gateway and c
 Run from the project root with the dependencies installed and your provider configured:
 
 ```sh
-python -m scripts.evaluations.run_eval
+python -m scripts.evaluations.eval_runner
 ```
 
 Prompts are defined in [`scripts/evaluations/golden_dataset.json`](scripts/evaluations/golden_dataset.json). Results are written to `scripts/evaluations/runs/`.

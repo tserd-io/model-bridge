@@ -8,25 +8,25 @@ with Path(__file__).with_name("config.json").open(encoding="utf-8") as config_fi
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", _settings["ollama_host"])
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", _settings["provider"]).lower()
+#Database
+IDEMPOTENCY_DB_PATH = os.getenv(
+	"IDEMPOTENCY_DB_PATH",
+	str(Path(__file__).resolve().parents[1] / "gateway_requests.sqlite3"),
+)
+#Timeout,replay attempts
+DEFAULT_LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", _settings["llm_timeout_seconds"]))
+REQUEST_DEADLINE_SECONDS = float(os.getenv("REQUEST_DEADLINE_SECONDS", _settings["request_deadline_seconds"]))
+MAX_LLM_ATTEMPTS = int(os.getenv("MAX_LLM_ATTEMPTS", _settings["max_llm_attempts"]))
+RETRY_BASE_DELAY_SECONDS = float(
+	os.getenv("RETRY_BASE_DELAY_SECONDS", _settings["retry_base_delay_seconds"])
+)
+#Fallback Provider (smallest local Ollama model by default)
 FALLBACK_PROVIDER = os.getenv(
 	"LLM_FALLBACK_PROVIDER",
 	_settings.get("fallback_provider"),
 )
 FALLBACK_PROVIDER = FALLBACK_PROVIDER.lower() if FALLBACK_PROVIDER else None
-
-DEFAULT_LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", _settings["llm_timeout_seconds"]))
-
-REQUEST_DEADLINE_SECONDS = float(os.getenv("REQUEST_DEADLINE_SECONDS", _settings["request_deadline_seconds"]))
-
-MAX_LLM_ATTEMPTS = int(os.getenv("MAX_LLM_ATTEMPTS", _settings["max_llm_attempts"]))
-
-RETRY_BASE_DELAY_SECONDS = float(
-	os.getenv("RETRY_BASE_DELAY_SECONDS", _settings["retry_base_delay_seconds"])
-)
-IDEMPOTENCY_DB_PATH = os.getenv(
-	"IDEMPOTENCY_DB_PATH",
-	str(Path(__file__).resolve().parents[1] / "gateway_requests.sqlite3"),
-)
+#Model Preference
 MODEL_PREFERENCES = {
 	preference: {
 		provider: os.getenv(f"{provider.upper()}_MODEL_{preference.upper()}", model)
@@ -34,9 +34,23 @@ MODEL_PREFERENCES = {
 	}
 	for preference, provider_models in _settings["model_preferences"].items()
 }
+#Pricing
 MODEL_PRICING_USD_PER_MILLION_TOKENS = json.loads(
 	os.getenv(
 		"MODEL_PRICING_USD_PER_MILLION_TOKENS",
 		json.dumps(_settings.get("model_pricing_usd_per_million_tokens", {})),
 	)
+)
+#Limiter settings
+RATE_LIMIT_REQUESTS = int(
+    os.getenv(
+        "RATE_LIMIT_REQUESTS",
+        _settings.get("rate_limit_requests", 60),
+    )
+)
+RATE_LIMIT_WINDOW_SECONDS = float(
+    os.getenv(
+        "RATE_LIMIT_WINDOW_SECONDS",
+        _settings.get("rate_limit_window_seconds", 60),
+    )
 )

@@ -1,12 +1,11 @@
 """Health probes tested against temporary databases, without model calls."""
 
 import sqlite3
-from types import SimpleNamespace
-
 import pytest
 from fastapi.testclient import TestClient
 
 
+# Creates isolated request storage and a client while forbidding model calls from health probes.
 @pytest.fixture
 def health_app(monkeypatch, tmp_path):
     database_path = tmp_path / "requests.sqlite3"
@@ -19,6 +18,7 @@ def health_app(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main, "request_store", RequestStore(database_path))
 
+    # Fails immediately if a health probe attempts generation.
     async def unexpected_model_call(*args, **kwargs):
         pytest.fail("Health probes must not call a model")
 
@@ -27,18 +27,25 @@ def health_app(monkeypatch, tmp_path):
         yield main, client
 
 
+# Checks that liveness responds successfully without accessing the database.
 def test_liveness_does_not_access_database(health_app, monkeypatch):
     main, client = health_app
 
+    # Fails immediately if liveness attempts to inspect the database.
     def unexpected_database_check():
         pytest.fail("Liveness must not depend on database availability")
 
-    monkeypatch.setattr(main, "_check_database", unexpected_database_check)
+    monkeypatch.setattr(
+        main.request_store,
+        "check_readable",
+        unexpected_database_check,
+    )
     response = client.get("/health/live")
     assert response.status_code == 200
     assert response.json() == {"status": "alive"}
 
 
+# Checks that readiness returns HTTP 200 when the requests table is readable.
 def test_readiness_with_healthy_database(health_app):
     _, client = health_app
     response = client.get("/health/ready")
@@ -46,6 +53,7 @@ def test_readiness_with_healthy_database(health_app):
     assert response.json() == {"status": "ready", "checks": {"database": "ok"}}
 
 
+# Checks HTTP 503 for missing, corrupt, or schema-less databases while liveness remains available.
 @pytest.mark.parametrize("database_state", ["missing", "corrupt", "missing_schema"])
 def test_readiness_with_unavailable_database(
     health_app, monkeypatch, tmp_path, database_state
@@ -58,7 +66,9 @@ def test_readiness_with_unavailable_database(
         sqlite3.connect(database_path).close()
 
     monkeypatch.setattr(
-        main, "request_store", SimpleNamespace(database_path=database_path)
+        main.request_store,
+        "database_path",
+        database_path,
     )
     response = client.get("/health/ready")
     assert response.status_code == 503
@@ -70,14 +80,19 @@ def test_readiness_with_unavailable_database(
         assert not database_path.exists()
 
 
+# Checks that readiness recovers after database access is restored.
 def test_readiness_recovers_after_database_returns(health_app, monkeypatch, tmp_path):
     main, client = health_app
-    healthy_store = main.request_store
+    healthy_path = main.request_store.database_path
     monkeypatch.setattr(
-        main,
-        "request_store",
-        SimpleNamespace(database_path=tmp_path / "missing.sqlite3"),
+        main.request_store,
+        "database_path",
+        tmp_path / "missing.sqlite3",
     )
     assert client.get("/health/ready").status_code == 503
-    monkeypatch.setattr(main, "request_store", healthy_store)
+    monkeypatch.setattr(
+        main.request_store,
+        "database_path",
+        healthy_path,
+    )
     assert client.get("/health/ready").status_code == 200

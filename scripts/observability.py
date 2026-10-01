@@ -65,6 +65,7 @@ PROVIDER_TIMEOUTS_TOTAL = Counter(
 )
 
 
+# Normalizes metric labels and supplies defaults for missing context.
 def _labels(
     provider: str,
     model: str | None,
@@ -83,6 +84,7 @@ def _labels(
     }
 
 
+# Emits an event and its context as one structured JSON log entry.
 def log_event(event: str, **fields: Any) -> None:
     logger.info(
         json.dumps(
@@ -94,6 +96,7 @@ def log_event(event: str, **fields: Any) -> None:
     )
 
 
+# Updates request counts, latency, usage, and cache metrics with a request-ID exemplar.
 def record_request(
     request_id: str,
     provider: str,
@@ -132,6 +135,7 @@ def record_request(
         CACHE_HITS_TOTAL.labels(**labels).inc(exemplar=exemplar)
 
 
+# Counts provider attempts, retries, errors, and timeouts with request correlation.
 def record_provider_attempt(
     request_id: str,
     provider: str,
@@ -154,6 +158,7 @@ def record_provider_attempt(
         PROVIDER_TIMEOUTS_TOTAL.labels(**labels).inc(exemplar=exemplar)
 
 
+# Counts a fallback selection and identifies its source and destination providers.
 def record_fallback(
     request_id: str,
     provider: str,

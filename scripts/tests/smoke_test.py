@@ -12,26 +12,28 @@ project_root = str(Path(__file__).resolve().parents[2])
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from scripts.config import LLM_PROVIDER, MAX_LLM_ATTEMPTS
-import scripts.functions as functions
+from scripts.load_settings import LLM_PROVIDER, MAX_LLM_ATTEMPTS
+import scripts.generation as generation
 import scripts.main as main_module
-from scripts.functions import llm_call
+from scripts.generation import llm_call
 from scripts.main import app
+from scripts.contracts import GenerationResult, RetryableProviderError
 from scripts.providers import (
-    GenerationResult,
     OpenAIProvider,
     OllamaProvider,
-    RetryableProviderError,
     is_retryable_status_code,
     run_with_attempt_timeout,
 )
+from scripts.schemas import ChatRequest
 from scripts.request_store import RequestStore
 
 PROMPT_TEXT = "Reply with exactly: Ollama is working."
 MODEL_PREFERENCE = "fast"
 
 
+# Simulates a two-second completion while respecting the supplied attempt timeout.
 class DelayedProvider:
+    # Runs a simulated slow completion within the supplied attempt timeout.
     async def complete(
         self,
         request_id: str,
@@ -41,6 +43,7 @@ class DelayedProvider:
         max_tokens: int,
         timeout: float,
     ) -> GenerationResult:
+        # Waits two seconds before producing a predictable response.
         async def delayed_completion() -> GenerationResult:
             await asyncio.sleep(2)
             return GenerationResult(
@@ -51,11 +54,14 @@ class DelayedProvider:
         return await run_with_attempt_timeout(delayed_completion(), timeout)
 
 
+# Fails a configurable number of calls before succeeding to exercise retry behavior.
 class FlakyProvider:
+    # Configures how many calls fail before recovery and initializes the call counter.
     def __init__(self, failures_before_success: int) -> None:
         self.failures_before_success = failures_before_success
         self.call_count = 0
 
+    # Counts calls, raises the configured transient failures, and then returns a response.
     async def complete(
         self,
         request_id: str,
@@ -74,10 +80,13 @@ class FlakyProvider:
         )
 
 
+# Counts successful calls so duplicate requests can be checked for unnecessary generation.
 class CountingProvider:
+    # Initializes a counter for detecting repeated generation.
     def __init__(self) -> None:
         self.call_count = 0
 
+    # Counts the call and returns a predictable result for replay checks.
     async def complete(
         self,
         request_id: str,
@@ -94,10 +103,13 @@ class CountingProvider:
         )
 
 
+# Counts calls and simulates timeouts where the provider outcome remains uncertain.
 class AmbiguousProvider:
+    # Initializes the count of simulated uncertain provider calls.
     def __init__(self) -> None:
         self.call_count = 0
 
+    # Counts the call and simulates a timeout that may have completed remotely.
     async def complete(
         self,
         request_id: str,
@@ -114,16 +126,19 @@ class AmbiguousProvider:
         )
 
 
+# Checks replay, conflicting IDs, pending and uncertain outcomes, and persistence after reopening SQLite.
 def smoke_idempotency() -> None:
     original_store = main_module.request_store
-    original_provider = functions.provider
+    original_provider = main_module.primary_provider
+    original_backup = main_module.backup_provider
     with TemporaryDirectory() as directory:
         database_path = Path(directory) / "requests.sqlite3"
         main_module.request_store = RequestStore(database_path)
         provider = CountingProvider()
-        functions.provider = provider
+        main_module.primary_provider = provider
+        main_module.backup_provider = None
         try:
-            with TestClient(app) as client:
+            with TestClient(main_module.app) as client:
                 success_payload = {
                     "request_id": "smoke-idempotent-success",
                     "message": "hello",
@@ -171,7 +186,7 @@ def smoke_idempotency() -> None:
                     raise AssertionError("Duplicate in-progress request was not reported")
 
                 unknown_provider = AmbiguousProvider()
-                functions.provider = unknown_provider
+                main_module.primary_provider = unknown_provider
                 unknown_payload = {
                     "request_id": "smoke-idempotent-unknown",
                     "message": "maybe generated",
@@ -196,10 +211,13 @@ def smoke_idempotency() -> None:
                     raise AssertionError("Saved response did not persist after reopening the DB")
                 print("Idempotency: replay, conflict, in-progress, and unknown checks passed")
         finally:
+            # Restore the original database store and provider even when a smoke assertion fails.
             main_module.request_store = original_store
-            functions.provider = original_provider
+            main_module.primary_provider = original_provider
+            main_module.backup_provider = original_backup
 
 
+# Checks retryable error classification and uncertainty after transport failures.
 def smoke_retry_classification() -> None:
     retryable = (408, 429, 500, 502, 503, 504)
     permanent = (400, 401, 403, 404, 422, 501)
@@ -208,10 +226,13 @@ def smoke_retry_classification() -> None:
     if any(is_retryable_status_code(status) for status in permanent):
         raise AssertionError("A permanent client error was classified as retryable")
 
+    # Raises a supplied exception from chat calls to exercise the Ollama adapter's error classification.
     class FailingClient:
+        # Stores the exception the fake client will raise.
         def __init__(self, error: Exception) -> None:
             self.error = error
 
+        # Raises the injected exception to exercise the Ollama adapter error handler.
         async def chat(self, **kwargs):
             raise self.error
 
@@ -231,6 +252,7 @@ def smoke_retry_classification() -> None:
                 )
             )
         except RetryableProviderError as exc:
+            # Verify that the adapter preserved uncertainty for the injected transport failure.
             if not exc.outcome_unknown:
                 raise AssertionError("Transport failure should retain its unknown outcome")
         else:
@@ -238,12 +260,14 @@ def smoke_retry_classification() -> None:
     print("Retry classification: statuses, timeouts, and connection resets checked")
 
 
+# Checks that OpenAI tracing headers contain the request ID and attempt number.
 def smoke_openai_correlation_header() -> None:
     captured_request = {}
 
+    # Captures outbound SDK arguments and supplies a minimal response stub.
     async def fake_create(**kwargs):
         captured_request.update(kwargs)
-        return SimpleNamespace(output_text="stubbed OpenAI response")
+        return SimpleNamespace(output_text="stubbed OpenAI response", usage = None)
 
     provider = OpenAIProvider.__new__(OpenAIProvider)
     provider.client = SimpleNamespace(
@@ -267,112 +291,128 @@ def smoke_openai_correlation_header() -> None:
     print("OpenAI correlation header: request ID and attempt are attached")
 
 
+# Checks recovery after transient failures and enforcement of the attempt limit.
 def smoke_bounded_retries() -> None:
-    original_provider = functions.provider
     provider = FlakyProvider(failures_before_success=2)
-    functions.provider = provider
+
+    result = asyncio.run(
+        llm_call(
+            request_id="smoke-retry-success",
+            message="retry smoke test",
+            model_preference="fast",
+            max_tokens=50,
+            provider=provider,
+            provider_name="fake",
+            request_deadline_seconds=10,
+            max_attempts=3,
+            retry_base_delay_seconds=0,
+        )
+    )
+
+    if provider.call_count != 3 or result.attempts != 3:
+        raise AssertionError("Expected success on the third provider attempt")
+
+    provider.failures_before_success = 10
+    provider.call_count = 0
+
     try:
-        result = asyncio.run(
+        asyncio.run(
             llm_call(
-                request_id="smoke-retry-success",
-                message="retry smoke test",
+                request_id="smoke-retry-exhausted",
+                message="retry exhaustion smoke test",
                 model_preference="fast",
                 max_tokens=50,
+                provider=provider,
+                provider_name="fake",
                 request_deadline_seconds=10,
                 max_attempts=3,
                 retry_base_delay_seconds=0,
             )
         )
-        if provider.call_count != 3 or result.attempts != 3:
-            raise AssertionError("Expected success on the third provider attempt")
+    except RetryableProviderError:
+        # Verify that retry exhaustion stopped at the configured call limit.
+        if provider.call_count != 3:
+            raise AssertionError("Expected the configured three-attempt cap")
+    else:
+        raise AssertionError("Expected transient failures to exhaust the attempt cap")
 
-        provider.failures_before_success = 10
-        provider.call_count = 0
+    print("Retries: recovery and attempt cap checked")
+
+
+# Checks per-attempt timeout behavior using a provider with a controlled delay.
+def smoke_timeout_limits() -> None:
+    
+    provider = DelayedProvider()
+    
+    for timeout_seconds in (1, 5, 10):
+        started_at = time.monotonic()
         try:
             asyncio.run(
                 llm_call(
-                    request_id="smoke-retry-exhausted",
-                    message="retry exhaustion smoke test",
+                    request_id=f"smoke-attempt-timeout-{timeout_seconds}",
+                    message="timeout smoke test",
                     model_preference="fast",
                     max_tokens=50,
-                    request_deadline_seconds=10,
-                    max_attempts=3,
+                    timeout_seconds=timeout_seconds,
+                    max_attempts=1,
                     retry_base_delay_seconds=0,
+                    provider=provider,
+                    provider_name="fake",
                 )
             )
-        except RetryableProviderError:
-            if provider.call_count != 3:
-                raise AssertionError("Expected the configured three-attempt cap")
+        except asyncio.TimeoutError:
+            # Recognize a raw timeout as a timed-out completion.
+            timed_out = True
+        except RetryableProviderError as exc:
+            # Interpret the wrapped uncertain failure from the simulated provider as a timeout.
+            timed_out = exc.outcome_unknown
         else:
-            raise AssertionError("Expected transient failures to exhaust the attempt cap")
-        print("Retries: recovery and attempt cap checked")
-    finally:
-        functions.provider = original_provider
+            timed_out = False
+        elapsed = time.monotonic() - started_at
+        if timed_out != (timeout_seconds < 2):
+            raise AssertionError(f"Unexpected per-attempt timeout at {timeout_seconds}s")
+        print(f"Attempt timeout {timeout_seconds}s: {elapsed:.2f}s")
+    
 
 
-def smoke_timeout_limits() -> None:
-    original_provider = functions.provider
-    functions.provider = DelayedProvider()
-    try:
-        for timeout_seconds in (1, 5, 10):
-            started_at = time.monotonic()
-            try:
-                asyncio.run(
-                    llm_call(
-                        request_id=f"smoke-attempt-timeout-{timeout_seconds}",
-                        message="timeout smoke test",
-                        model_preference="fast",
-                        max_tokens=50,
-                        timeout_seconds=timeout_seconds,
-                        max_attempts=1,
-                        retry_base_delay_seconds=0,
-                    )
-                )
-            except asyncio.TimeoutError:
-                timed_out = True
-            except RetryableProviderError as exc:
-                timed_out = exc.outcome_unknown
-            else:
-                timed_out = False
-            elapsed = time.monotonic() - started_at
-            if timed_out != (timeout_seconds < 2):
-                raise AssertionError(f"Unexpected per-attempt timeout at {timeout_seconds}s")
-            print(f"Attempt timeout {timeout_seconds}s: {elapsed:.2f}s")
-    finally:
-        functions.provider = original_provider
-
-
+# Checks overall request-deadline behavior using a provider with a controlled delay.
 def smoke_request_deadline_limits() -> None:
-    original_provider = functions.provider
-    functions.provider = DelayedProvider()
-    try:
-        for deadline_seconds in (1, 5, 10):
-            try:
-                asyncio.run(
-                    llm_call(
-                        request_id=f"smoke-overall-deadline-{deadline_seconds}",
-                        message="overall deadline smoke test",
-                        model_preference="fast",
-                        max_tokens=50,
-                        timeout_seconds=30,
-                        request_deadline_seconds=deadline_seconds,
-                    )
+    
+    provider = DelayedProvider()
+    
+    for deadline_seconds in (1, 5, 10):
+        try:
+            asyncio.run(
+                llm_call(
+                    request_id=f"smoke-overall-deadline-{deadline_seconds}",
+                    message="overall deadline smoke test",
+                    model_preference="fast",
+                    max_tokens=50,
+                    timeout_seconds=30,
+                    request_deadline_seconds=deadline_seconds,
+                    provider=provider,
+                    provider_name="fake",
                 )
-            except asyncio.TimeoutError:
-                timed_out = True
-            else:
-                timed_out = False
-            if timed_out != (deadline_seconds < 2):
-                raise AssertionError(f"Unexpected overall deadline at {deadline_seconds}s")
-            print(f"Overall deadline {deadline_seconds}s: {'timeout' if timed_out else 'completed'}")
-    finally:
-        functions.provider = original_provider
+            )
+        except asyncio.TimeoutError:
+            # Recognize a raw deadline timeout; structured deadline errors are not caught by this block.
+            timed_out = True
+        except RetryableProviderError as exc:
+            # Recognize the structured timeout or deadline error from generation.
+            timed_out = exc.failure_type in {"timeout", "deadline_exceeded"}
+        else:
+            timed_out = False
+        if timed_out != (deadline_seconds < 2):
+            raise AssertionError(f"Unexpected overall deadline at {deadline_seconds}s")
+        print(f"Overall deadline {deadline_seconds}s: {'timeout' if timed_out else 'completed'}")
+    
 
 
+# Sends a sample request through the configured provider, then runs the smoke routines.
 def main() -> None:
     request_id = f"smoke-{uuid4()}"
     print(f"Testing {LLM_PROVIDER} with the {MODEL_PREFERENCE} preference")
-    with TestClient(app) as client:
+    with TestClient(main_module.app) as client:
         response = client.post(
             "/chat",
             json={

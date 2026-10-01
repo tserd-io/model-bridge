@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+# Signals that a request ID was reused with a different payload.
 class IdempotencyConflictError(Exception):
     """A request ID was reused with a different request payload."""
 
 
+# Holds the result of claiming a request, including its state and any saved response.
 @dataclass(frozen=True)
 class RequestRecord:
     status: str
@@ -20,7 +22,9 @@ class RequestRecord:
     attempts: int = 0
 
 
+# Uses SQLite to claim request IDs, detect duplicates, track processing leases, and save outcomes.
 class RequestStore:
+    # Prepares the database directory, enables WAL journaling, and creates request storage if needed.
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,7 +47,18 @@ class RequestStore:
                 """
             )
             connection.commit()
-
+    # Checks existing storage without creating a missing database or table.
+    def check_readable(self) -> None:
+        database_uri = self.database_path.resolve().as_uri() + "?mode=ro"
+        connection = sqlite3.connect(database_uri, uri=True, timeout=1)
+        try:
+            connection.execute(
+                "SELECT request_id FROM requests LIMIT 1"
+            ).fetchone()
+        finally:
+            # Release the connection even when the query fails.
+            connection.close()
+    # Yields a SQLite connection with named columns and closes it when the caller exits.
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.database_path, timeout=5)
@@ -51,8 +66,10 @@ class RequestStore:
         try:
             yield connection
         finally:
+            # Always close the connection, including when the caller raises an exception.
             connection.close()
 
+    # Atomically claims a new request ID or returns its existing state after checking the payload hash.
     def claim(
         self,
         request_id: str,
@@ -128,6 +145,7 @@ class RequestStore:
                 attempts=row["attempts"],
             )
 
+    # Saves the successful response and its attempt count for future replay.
     def mark_success(self, request_id: str, response: dict[str, Any]) -> None:
         self._finish(
             request_id,
@@ -137,6 +155,7 @@ class RequestStore:
             attempts=response["attempts"],
         )
 
+    # Saves an uncertain outcome so duplicate requests do not restart generation.
     def mark_unknown(self, request_id: str, detail: str, attempts: int) -> None:
         self._finish(
             request_id,
@@ -146,6 +165,7 @@ class RequestStore:
             attempts=attempts,
         )
 
+    # Saves a definite failure and its attempt count.
     def mark_failed(self, request_id: str, detail: str, attempts: int) -> None:
         self._finish(
             request_id,
@@ -155,6 +175,7 @@ class RequestStore:
             attempts=attempts,
         )
 
+    # Updates an in-progress request and rejects missing or already-finalized records.
     def _finish(
         self,
         request_id: str,

@@ -6,25 +6,55 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
-import scripts.functions as functions
+import scripts.rate_limit as rate_limit_module
+from scripts.rate_limit import SlidingWindowRateLimiter
 import scripts.main as main_module
-from scripts.config import MAX_LLM_ATTEMPTS
-from scripts.evaluations.run_eval import run_evaluation
-from scripts.functions import llm_call
+from scripts.load_settings import MAX_LLM_ATTEMPTS
+from scripts.evaluations.eval_runner import run_evaluation
+from scripts.generation import llm_call
 from scripts.main import app
-from scripts.providers import (
-    FakeProvider,
-    GenerationResult,
-    RetryableProviderError,
-)
+from scripts.contracts import GenerationResult, RetryableProviderError
+from scripts.providers import FakeProvider
 from scripts.request_store import RequestStore
+# Gives API tests fake providers and prevents configured fallback calls.
+@pytest.fixture(autouse=True)
+def isolated_api_providers(monkeypatch):
+    monkeypatch.setattr(main_module, "primary_provider", FakeProvider())
+    monkeypatch.setattr(main_module, "backup_provider", None)
+    monkeypatch.setattr(main_module, "LLM_PROVIDER", "fake")
+    monkeypatch.setattr(main_module, "FALLBACK_PROVIDER", None)
+# Replaces only the limiter clock so tests can advance time without waiting.
+@pytest.fixture
+def limiter_clock(monkeypatch):
+    now = [100.0]
 
+    monkeypatch.setattr(
+        rate_limit_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: now[0]),
+    )
+    return now
+# Gives each test a fresh limiter so admission history cannot leak between tests.
+@pytest.fixture(autouse=True)
+def isolated_rate_limiter(monkeypatch):
 
+    monkeypatch.setattr(
+        main_module,
+        "chat_rate_limiter",
+        SlidingWindowRateLimiter(limit=100, window_seconds=60),
+    )
+# Records request IDs, attempt numbers, and messages while returning predictable fake responses.
 class RecordingFakeProvider(FakeProvider):
+    # Initializes the list used to inspect provider calls.
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, str]] = []
 
+    # Records the request and attempt before returning the standard fake response.
     async def complete(
         self,
         request_id: str,
@@ -45,7 +75,9 @@ class RecordingFakeProvider(FakeProvider):
         )
 
 
+# Rejects the first two attempt numbers and succeeds on the third to exercise retry recovery.
 class FailTwiceFakeProvider(RecordingFakeProvider):
+    # Records each call, fails attempts one and two, and returns a response on later attempts.
     async def complete(
         self,
         request_id: str,
@@ -64,10 +96,13 @@ class FailTwiceFakeProvider(RecordingFakeProvider):
         )
 
 
+# Counts calls and always raises an uncertain failure to exercise unknown-outcome persistence.
 class UnknownOutcomeFakeProvider:
+    # Initializes the call counter used to detect unwanted retries of saved outcomes.
     def __init__(self) -> None:
         self.call_count = 0
 
+    # Counts the call and raises a transient failure whose completion status is uncertain.
     async def complete(
         self,
         request_id: str,
@@ -84,10 +119,13 @@ class UnknownOutcomeFakeProvider:
         )
 
 
+# Records calls and always raises a transient error to trigger fallback.
 class AlwaysRetryFakeProvider:
+    # Initializes the primary-provider call history for fallback assertions.
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
 
+    # Records the request and attempt, then raises a transient rejection.
     async def complete(
         self,
         request_id: str,
@@ -101,10 +139,13 @@ class AlwaysRetryFakeProvider:
         raise RetryableProviderError("simulated rate limit")
 
 
+# Records fallback calls and returns a distinctive provider identity and response.
 class FallbackFakeProvider:
+    # Initializes the call history used to inspect fallback execution.
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
 
+    # Records the fallback attempt and returns a recognizable response and provider identity.
     async def complete(
         self,
         request_id: str,
@@ -122,6 +163,8 @@ class FallbackFakeProvider:
         )
 
 
+
+# Builds a minimal valid chat payload with a supplied request ID and message.
 def request_payload(request_id: str, message: str = "hello") -> dict[str, object]:
     return {
         "request_id": request_id,
@@ -131,6 +174,7 @@ def request_payload(request_id: str, message: str = "hello") -> dict[str, object
     }
 
 
+# Substitutes a unique SQLite database for a test and removes its files afterward.
 @pytest.fixture
 def isolated_request_store(monkeypatch: pytest.MonkeyPatch):
     database_path = Path.cwd() / f".pytest-requests-{uuid4().hex}.sqlite3"
@@ -142,16 +186,18 @@ def isolated_request_store(monkeypatch: pytest.MonkeyPatch):
     try:
         yield
     finally:
+        # Remove the temporary database and its journal files even if the test fails.
         for suffix in ("", "-wal", "-shm"):
             database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)
 
 
+# Checks response fields and confirms duplicates replay the saved result without another provider call.
 def test_post_response_is_normalized_and_duplicate_replays_saved_response(
     monkeypatch: pytest.MonkeyPatch,
     isolated_request_store,
 ) -> None:
     provider = RecordingFakeProvider()
-    monkeypatch.setattr(functions, "provider", provider)
+    monkeypatch.setattr(main_module, "primary_provider", provider)
     payload = request_payload(f"pytest-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -172,17 +218,18 @@ def test_post_response_is_normalized_and_duplicate_replays_saved_response(
     assert body["provider"] == "fake"
     assert body["content"] == "Fake response: hello"
     assert body["attempts"] == 1
-    assert duplicate.json() == body
+    assert duplicate.json() == {**body, "cache_hit": True}
     assert len(provider.calls) == 1
     assert 'request_id="' + payload["request_id"] + '"' in metrics.text
 
 
+# Checks that reusing a request ID with different input returns HTTP 409.
 def test_reusing_request_id_with_different_payload_returns_conflict(
     monkeypatch: pytest.MonkeyPatch,
     isolated_request_store,
 ) -> None:
     provider = RecordingFakeProvider()
-    monkeypatch.setattr(functions, "provider", provider)
+    monkeypatch.setattr(main_module, "primary_provider", provider)
     payload = request_payload(f"pytest-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -197,11 +244,9 @@ def test_reusing_request_id_with_different_payload_returns_conflict(
     assert len(provider.calls) == 1
 
 
-def test_retry_attempts_reuse_request_id_and_report_attempt_count(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+# Checks that retries preserve the request ID and report the total attempt count.
+def test_retry_attempts_reuse_request_id_and_report_attempt_count() -> None:
     provider = FailTwiceFakeProvider()
-    monkeypatch.setattr(functions, "provider", provider)
     request_id = f"pytest-retry-{uuid4().hex}"
 
     result = asyncio.run(
@@ -210,22 +255,24 @@ def test_retry_attempts_reuse_request_id_and_report_attempt_count(
             message="retry me",
             model_preference="fast",
             max_tokens=50,
+            provider=provider,
+            provider_name="fake",
             request_deadline_seconds=5,
             max_attempts=3,
             retry_base_delay_seconds=0,
         )
     )
-
     assert result.content == "recovered"
     assert result.attempts == 3
     assert [call[0] for call in provider.calls] == [request_id] * 3
     assert [call[1] for call in provider.calls] == [1, 2, 3]
 
 
-def test_configured_fallback_uses_remaining_attempt_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+# Checks that fallback continues within the original attempt budget.
+def test_configured_fallback_uses_remaining_attempt_budget() -> None:
+    # Simulates a primary provider that always rejects calls with a retryable error.
     class PrimaryProvider:
+        # Raises a retryable rejection to force the gateway to consider fallback.
         async def complete(
             self,
             request_id: str,
@@ -237,7 +284,9 @@ def test_configured_fallback_uses_remaining_attempt_budget(
         ) -> GenerationResult:
             raise RetryableProviderError("simulated 429")
 
+    # Checks the original request ID and second attempt number before returning a fallback result.
     class FallbackProvider:
+        # Verifies request continuity and the second attempt number before returning a fallback result.
         async def complete(
             self,
             request_id: str,
@@ -256,9 +305,6 @@ def test_configured_fallback_uses_remaining_attempt_budget(
             )
 
     expected_request_id = f"pytest-fallback-{uuid4().hex}"
-    monkeypatch.setattr(functions, "provider", PrimaryProvider())
-    monkeypatch.setattr(functions, "fallback_provider", FallbackProvider())
-    monkeypatch.setattr(functions, "FALLBACK_PROVIDER", "fallback-provider")
 
     result = asyncio.run(
         llm_call(
@@ -266,6 +312,10 @@ def test_configured_fallback_uses_remaining_attempt_budget(
             message="try fallback",
             model_preference="fast",
             max_tokens=50,
+            provider=PrimaryProvider(),
+            provider_name="fake",
+            fallback_provider=FallbackProvider(),
+            fallback_provider_name="fallback-provider",
             max_attempts=3,
             retry_base_delay_seconds=0,
         )
@@ -276,14 +326,10 @@ def test_configured_fallback_uses_remaining_attempt_budget(
     assert result.attempts == 2
 
 
-def test_retry_uses_configured_fallback_and_reports_actual_provider(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+# Checks that a primary failure switches providers and reports the fallback provider used.
+def test_retry_uses_configured_fallback_and_reports_actual_provider() -> None:
     primary = AlwaysRetryFakeProvider()
     fallback = FallbackFakeProvider()
-    monkeypatch.setattr(functions, "provider", primary)
-    monkeypatch.setattr(functions, "fallback_provider", fallback)
-    monkeypatch.setattr(functions, "FALLBACK_PROVIDER", "fallback-fake")
     request_id = f"pytest-fallback-{uuid4().hex}"
 
     result = asyncio.run(
@@ -292,6 +338,10 @@ def test_retry_uses_configured_fallback_and_reports_actual_provider(
             message="fall back",
             model_preference="fast",
             max_tokens=50,
+            provider=primary,
+            provider_name="fake",
+            fallback_provider=fallback,
+            fallback_provider_name="fallback-fake",
             request_deadline_seconds=5,
             max_attempts=3,
             retry_base_delay_seconds=0,
@@ -304,12 +354,13 @@ def test_retry_uses_configured_fallback_and_reports_actual_provider(
     assert result.attempts == 2
 
 
+# Checks that uncertain outcomes are saved and duplicate requests do not restart generation.
 def test_unknown_provider_outcome_is_persisted_and_not_called_again(
     monkeypatch: pytest.MonkeyPatch,
     isolated_request_store,
 ) -> None:
     provider = UnknownOutcomeFakeProvider()
-    monkeypatch.setattr(functions, "provider", provider)
+    monkeypatch.setattr(main_module, "primary_provider", provider)
     payload = request_payload(f"pytest-unknown-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -324,6 +375,7 @@ def test_unknown_provider_outcome_is_persisted_and_not_called_again(
     assert provider.call_count == MAX_LLM_ATTEMPTS
 
 
+# Checks task-based model selection and the high-risk human-review flag.
 @pytest.mark.parametrize(
     ("task_type", "requested_preference", "expected_model", "human_review"),
     [
@@ -334,14 +386,12 @@ def test_unknown_provider_outcome_is_persisted_and_not_called_again(
     ],
 )
 def test_task_routing_uses_requirements_and_flags_high_risk(
-    monkeypatch: pytest.MonkeyPatch,
     isolated_request_store,
     task_type: str | None,
     requested_preference: str,
     expected_model: str,
     human_review: bool,
 ) -> None:
-    monkeypatch.setattr(functions, "provider", FakeProvider())
     payload = request_payload(f"pytest-route-{uuid4().hex}")
     payload["model_preference"] = requested_preference
     if task_type is not None:
@@ -353,11 +403,27 @@ def test_task_routing_uses_requirements_and_flags_high_risk(
     assert response.json()["model"] == expected_model
     assert response.json()["human_review_required"] is human_review
 
+# Checks that 12 competing threads admit exactly 3 requests under a shared rate limit.
+def test_simultaneous_acquisition_respects_limit(limiter_clock):
+    limiter = SlidingWindowRateLimiter(limit=3, window_seconds=10)
+    workers = 12
+    barrier = Barrier(workers)
 
+    # Waits for competing threads to reach the barrier before requesting a limiter slot.
+    def acquire(_):
+        barrier.wait(timeout=5)
+        return limiter.try_acquire()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(acquire, range(workers)))
+
+    assert results.count(None) == 3
+    assert results.count(10) == 9
+
+# Checks saved evaluation versions, model identity, result labels, and unavailable cost reporting.
 def test_evaluation_runner_persists_versions_labels_and_usage(
-    monkeypatch: pytest.MonkeyPatch,
+    isolated_request_store,
 ) -> None:
-    monkeypatch.setattr(functions, "provider", FakeProvider())
     dataset = {
         "dataset_version": "unit-v1",
         "prompt_version": "prompt-v7",
@@ -384,9 +450,23 @@ def test_evaluation_runner_persists_versions_labels_and_usage(
         root = Path(directory)
         dataset_path = root / "dataset.json"
         dataset_path.write_text(json.dumps(dataset), encoding="utf-8")
-        summary = run_evaluation(dataset_path, root / "results")
+        with TestClient(app) as client:
+            summary = run_evaluation(
+                dataset_path,
+                root / "results",
+                client=client,
+                provider_name="fake",
+            )
+        saved_summary = json.loads(
+            (root / "results" / f"{summary['run_id']}-summary.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert saved_summary == summary
         result_path = next((root / "results").glob("*.jsonl"))
-        result = json.loads(result_path.read_text(encoding="utf-8").splitlines()[0])
+        result = json.loads(
+            result_path.read_text(encoding="utf-8").splitlines()[0]
+        )
 
     assert summary["dataset_version"] == "unit-v1"
     assert summary["prompt_version"] == "prompt-v7"
@@ -397,3 +477,36 @@ def test_evaluation_runner_persists_versions_labels_and_usage(
     assert result["known_failure_category"] == "instruction_following"
     assert result["grounding"]["faithfulness"] is None
     assert result["agentic_metrics"]["applicable"] is False
+
+
+# Checks HTTP 429, rounded Retry-After, and rejection before database or provider work.
+def test_rate_limit_returns_retry_after(
+    monkeypatch,
+    isolated_request_store,
+    limiter_clock,
+):
+    limiter = SlidingWindowRateLimiter(limit=1, window_seconds=10)
+    assert limiter.try_acquire() is None
+
+    limiter_clock[0] = 100.2
+
+    claim = Mock(side_effect=AssertionError("Database must not be called"))
+    generate = AsyncMock(
+        side_effect=AssertionError("Provider must not be called")
+    )
+
+    monkeypatch.setattr(main_module, "chat_rate_limiter", limiter)
+    monkeypatch.setattr(main_module.request_store, "claim", claim)
+    monkeypatch.setattr(main_module, "llm_call", generate)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/chat",
+            json=request_payload("rate-limit-header"),
+        )
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "10"
+    assert response.json()["attempts"] == 0
+    claim.assert_not_called()
+    generate.assert_not_called()

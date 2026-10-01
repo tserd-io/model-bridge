@@ -1,23 +1,53 @@
 import asyncio
 import time
+import sqlite3
 from typing import Literal
-
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
-from pydantic import BaseModel, Field
 
-from scripts.config import IDEMPOTENCY_DB_PATH, LLM_PROVIDER, REQUEST_DEADLINE_SECONDS
-from scripts.functions import llm_call
+from scripts.schemas import ChatRequest, ChatResponse
+from scripts.generation import llm_call
 from scripts.observability import log_event, record_request
-from scripts.providers import (
+from scripts.request_store import IdempotencyConflictError, RequestStore
+from scripts.rate_limit import SlidingWindowRateLimiter
+from scripts.providers import create_provider
+
+from scripts.load_settings import (
+    DEFAULT_LLM_TIMEOUT_SECONDS,
+    FALLBACK_PROVIDER,
+    IDEMPOTENCY_DB_PATH,
+    LLM_PROVIDER,
+    MAX_LLM_ATTEMPTS,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    REQUEST_DEADLINE_SECONDS,
+    RETRY_BASE_DELAY_SECONDS,
+)
+from scripts.contracts import (
     PermanentProviderError,
     ProviderOutcomeUnknown,
     RetryableProviderError,
 )
-from scripts.request_store import IdempotencyConflictError, RequestStore
-import sqlite3
+from scripts.chat_service import (
+    _record_request_outcome,
+    _route_model_preference,
+    _state_result,
+)
 
+
+primary_provider = create_provider(LLM_PROVIDER)
+
+backup_provider = (
+    create_provider(FALLBACK_PROVIDER)
+    if FALLBACK_PROVIDER
+    else None
+)
+
+chat_rate_limiter = SlidingWindowRateLimiter(
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+)
 
 app = FastAPI()
 app.mount("/metrics", make_asgi_app())
@@ -26,25 +56,19 @@ UNKNOWN_OUTCOME_DETAIL = (
     "The provider may have completed this request; do not resubmit it automatically"
 )
 
+# Reports that the app can respond without checking its dependencies.
 @app.get("/health/live", tags=["health"])
 
 async def liveness() -> dict[str, str]:
     return {"status": "alive"}
 
-def _check_database() -> None:
-    # Open the existing database without accidentally creating a new one.
-    database_uri = request_store.database_path.resolve().as_uri() + "?mode=ro"
-    connection = sqlite3.connect(database_uri, uri=True, timeout=1)
-    try:
-        connection.execute("SELECT request_id FROM requests LIMIT 1").fetchone()
-    finally:
-        connection.close()
-
+# Returns HTTP 200 for readable request storage or HTTP 503 when the check fails.
 @app.get("/health/ready", tags=["health"])
 async def readiness() -> JSONResponse:
     try:
-        await asyncio.to_thread(_check_database)
+        await asyncio.to_thread(request_store.check_readable)
     except sqlite3.Error:
+        # Report storage as unavailable without exposing internal database error details.
         return JSONResponse(
             status_code=503,
             content={"status": "not_ready", "checks": {"database": "failed"}},
@@ -55,156 +79,7 @@ async def readiness() -> JSONResponse:
         content={"status": "ready", "checks": {"database": "ok"}},
     )
 
-class ChatRequest(BaseModel):
-    request_id: str = Field(min_length=1, max_length=128)
-    tenant_id: str = Field(
-        default="default",
-        min_length=1,
-        max_length=64,
-        pattern=r"^[A-Za-z0-9_.:-]+$",
-    )
-    message: str = Field(min_length=1)
-    model_preference: Literal["fast", "balanced"]
-    max_tokens: int = Field(ge=1, le=8192)
-    task_type: Literal["simple", "complex", "high_risk"] | None = None
-
-
-class ChatResponse(BaseModel):
-    request_id: str
-    status: Literal["success", "in_progress", "unknown", "failed"]
-    provider: str | None = None
-    model: str | None = None
-    content: str | None = None
-    latency_ms: int | None = None
-    attempts: int = 0
-    detail: str | None = None
-    route: str | None = None
-    task_type: str | None = None
-    tenant_id: str | None = None
-    human_review_required: bool = False
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    estimated_cost_usd: float | None = None
-    cache_hit: bool = False
-
-
-def _state_response(
-    request: ChatRequest,
-    status: Literal["in_progress", "unknown", "failed"],
-    route: str,
-    detail: str,
-    attempts: int = 0,
-) -> ChatResponse:
-    return ChatResponse(
-        request_id=request.request_id,
-        status=status,
-        detail=detail,
-        attempts=attempts,
-        route=route,
-        task_type=request.task_type,
-        tenant_id=request.tenant_id,
-        human_review_required=request.task_type == "high_risk",
-    )
-
-
-def _record_request_outcome(
-    request: ChatRequest,
-    route: str,
-    status: str,
-    status_code: int,
-    started_at: float,
-    attempts: int,
-    provider: str | None = None,
-    model: str | None = None,
-    error_type: str = "none",
-    input_tokens: int | None = None,
-    output_tokens: int | None = None,
-    estimated_cost_usd: float | None = None,
-    cache_hit: bool = False,
-    timed_out: bool = False,
-) -> int:
-    latency_ms = round((time.perf_counter() - started_at) * 1000)
-    provider_name = provider or LLM_PROVIDER
-    record_request(
-        request.request_id,
-        provider_name,
-        status,
-        latency_ms,
-        model=model,
-        route=route,
-        tenant=request.tenant_id,
-        error_type=error_type,
-        status_code=status_code,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        estimated_cost_usd=estimated_cost_usd,
-        cache_hit=cache_hit,
-        timed_out=timed_out,
-    )
-    log_event(
-        "request_finished",
-        request_id=request.request_id,
-        provider=provider_name,
-        model=model,
-        route=route,
-        tenant=request.tenant_id,
-        status=status,
-        status_code=status_code,
-        attempts=attempts,
-        latency_ms=latency_ms,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        estimated_cost_usd=estimated_cost_usd,
-        cache_hit=cache_hit,
-        error_type=error_type,
-        timed_out=timed_out,
-    )
-    return latency_ms
-
-
-def _route_model_preference(
-    task_type: str | None,
-    requested_preference: str,
-) -> str:
-    if task_type == "simple":
-        return "fast"
-    if task_type in {"complex", "high_risk"}:
-        return "balanced"
-    return requested_preference
-
-
-def _state_result(
-    request: ChatRequest,
-    route: str,
-    status: Literal["in_progress", "unknown", "failed"],
-    detail: str,
-    status_code: int,
-    started_at: float,
-    attempts: int = 0,
-    error_type: str = "none",
-    timed_out: bool = False,
-    cache_hit: bool = False,
-) -> JSONResponse:
-    _record_request_outcome(
-        request,
-        route,
-        status,
-        status_code,
-        started_at,
-        attempts,
-        error_type=error_type,
-        timed_out=timed_out,
-        cache_hit=cache_hit,
-    )
-    response = _state_response(request, status, route, detail, attempts)
-    headers = {"Retry-After": "1"} if status == "in_progress" else None
-    return JSONResponse(
-        status_code=status_code,
-        content=response.model_dump(mode="json"),
-        headers=headers,
-    )
-
-
+# Routes and rate-limits requests, handles deduplication, generates an answer, and saves its outcome.
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
     started_at = time.perf_counter()
@@ -221,7 +96,20 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
         tenant=request.tenant_id,
         model_preference=model_preference,
     )
-
+    #limiter gate prevents user from overloading the app with requests
+    retry_after = chat_rate_limiter.try_acquire()
+    if retry_after is not None:
+        response = _state_result(
+            request=request,
+            route=route,
+            status="failed",
+            detail="Rate limit exceeded; retry after the indicated delay",
+            status_code=429,
+            started_at=started_at,
+            error_type="rate_limited",
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response   
     try:
         record = await asyncio.to_thread(
             request_store.claim,
@@ -230,6 +118,7 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             REQUEST_DEADLINE_SECONDS + 5,
         )
     except IdempotencyConflictError as exc:
+        # Return HTTP 409 because this request ID already represents different input.
         return _state_result(
             request,
             route,
@@ -298,10 +187,19 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             message=request.message,
             model_preference=model_preference,
             max_tokens=request.max_tokens,
+            provider=primary_provider,
+            provider_name=LLM_PROVIDER,
+            fallback_provider=backup_provider,
+            fallback_provider_name=FALLBACK_PROVIDER,
             route=route,
             tenant_id=request.tenant_id,
+            timeout_seconds=DEFAULT_LLM_TIMEOUT_SECONDS,
+            request_deadline_seconds=REQUEST_DEADLINE_SECONDS,
+            max_attempts=MAX_LLM_ATTEMPTS,
+            retry_base_delay_seconds=RETRY_BASE_DELAY_SECONDS,
         )
     except ProviderOutcomeUnknown as exc:
+        # Persist an uncertain outcome and return HTTP 202 without automatically resubmitting it.
         await asyncio.to_thread(
             request_store.mark_unknown,
             request.request_id,
@@ -319,6 +217,7 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             error_type="unknown_outcome",
         )
     except asyncio.TimeoutError as exc:
+        # Conservatively save an unknown outcome with zero attempts because this exception has no count.
         await asyncio.to_thread(
             request_store.mark_unknown,
             request.request_id,
@@ -336,9 +235,18 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             timed_out=True,
         )
     except RetryableProviderError as exc:
+        # Use accumulated uncertainty to choose unknown/202 or failed/503 and preserve the attempt count.
         status = "unknown" if exc.outcome_unknown else "failed"
-        detail = UNKNOWN_OUTCOME_DETAIL if exc.outcome_unknown else "Provider rejected the request after the retry limit"
+
+        if exc.outcome_unknown:
+            detail = UNKNOWN_OUTCOME_DETAIL
+        elif exc.failure_type == "deadline_exceeded":
+            detail = "The request deadline left no time for another attempt"
+        else:
+            detail = "Provider rejected the request after the retry limit"
+        
         status_code = 202 if exc.outcome_unknown else 503
+        
         if exc.outcome_unknown:
             await asyncio.to_thread(
                 request_store.mark_unknown,
@@ -362,9 +270,10 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             started_at,
             exc.attempts,
             error_type=exc.failure_type,
-            timed_out=exc.failure_type == "timeout",
+            timed_out=exc.failure_type in {"timeout", "deadline_exceeded"},
         )
     except PermanentProviderError as exc:
+        # Persist a definite rejection and return HTTP 502 with the recorded attempt count.
         await asyncio.to_thread(
             request_store.mark_failed,
             request.request_id,
@@ -382,6 +291,7 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             error_type="provider_rejection",
         )
     except Exception as exc:
+        # Conservatively save unknown because an unexpected failure does not establish provider completion.
         await asyncio.to_thread(
             request_store.mark_unknown,
             request.request_id,
@@ -434,3 +344,13 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
         estimated_cost_usd=result.estimated_cost_usd,
     )
     return response
+
+
+
+
+
+
+
+
+
+
