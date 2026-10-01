@@ -7,13 +7,16 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from scripts.schemas import ChatRequest, ChatResponse
-from scripts.generation import llm_call
+from scripts.generation import CircuitUnavailableError, llm_call
 from scripts.observability import log_event, record_request
 from scripts.request_store import IdempotencyConflictError, RequestStore
 from scripts.rate_limit import SlidingWindowRateLimiter
 from scripts.providers import create_provider
+from scripts.circuit_breaker import CircuitBreaker
 
 from scripts.load_settings import (
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+    CIRCUIT_BREAKER_COOLDOWN_SECONDS,
     DEFAULT_LLM_TIMEOUT_SECONDS,
     FALLBACK_PROVIDER,
     IDEMPOTENCY_DB_PATH,
@@ -43,6 +46,18 @@ backup_provider = (
     if FALLBACK_PROVIDER
     else None
 )
+
+# Shares one process-local breaker per configured backend, including same-provider fallback.
+provider_breakers = {
+    name: CircuitBreaker(
+        failure_threshold=CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+        cooldown_seconds=CIRCUIT_BREAKER_COOLDOWN_SECONDS,
+    )
+    for name in {LLM_PROVIDER, FALLBACK_PROVIDER}
+    if name is not None
+}
+primary_breaker = provider_breakers[LLM_PROVIDER]
+backup_breaker = provider_breakers.get(FALLBACK_PROVIDER)
 
 chat_rate_limiter = SlidingWindowRateLimiter(
     RATE_LIMIT_REQUESTS,
@@ -191,6 +206,8 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             provider_name=LLM_PROVIDER,
             fallback_provider=backup_provider,
             fallback_provider_name=FALLBACK_PROVIDER,
+            circuit_breaker=primary_breaker,
+            fallback_circuit_breaker=backup_breaker,
             route=route,
             tenant_id=request.tenant_id,
             timeout_seconds=DEFAULT_LLM_TIMEOUT_SECONDS,
@@ -233,6 +250,71 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             started_at,
             error_type="timeout",
             timed_out=True,
+        )
+    except CircuitUnavailableError as exc:
+        # Earlier uncertain work must never become automatically retryable.
+        if exc.outcome_unknown:
+            await asyncio.to_thread(
+                request_store.mark_unknown,
+                request.request_id,
+                UNKNOWN_OUTCOME_DETAIL,
+                exc.attempts,
+            )
+            return _state_result(
+                request,
+                route,
+                "unknown",
+                UNKNOWN_OUTCOME_DETAIL,
+                202,
+                started_at,
+                exc.attempts,
+                error_type="circuit_open",
+            )
+
+        if exc.attempts == 0:
+            detail = (
+                "Provider temporarily unavailable; no provider call was made. "
+                "Retry this request after the indicated delay."
+            )
+            await asyncio.to_thread(
+                request_store.mark_retryable,
+                request.request_id,
+                detail,
+            )
+            response = _state_result(
+                request,
+                route,
+                "failed",
+                detail,
+                503,
+                started_at,
+                0,
+                error_type="circuit_open",
+            )
+            response.headers["Retry-After"] = str(exc.retry_after)
+            return response
+
+        # Preserve the existing terminal-failure policy after actual,
+        # definitively failed calls; do not advertise same-ID retry.
+        detail = (
+            "Provider temporarily unavailable after failed provider attempts. "
+            "This request has been recorded as failed."
+        )
+        await asyncio.to_thread(
+            request_store.mark_failed,
+            request.request_id,
+            detail,
+            exc.attempts,
+        )
+        return _state_result(
+            request,
+            route,
+            "failed",
+            detail,
+            503,
+            started_at,
+            exc.attempts,
+            error_type="circuit_open",
         )
     except RetryableProviderError as exc:
         # Use accumulated uncertainty to choose unknown/202 or failed/503 and preserve the attempt count.

@@ -54,3 +54,17 @@ RATE_LIMIT_WINDOW_SECONDS = float(
         _settings.get("rate_limit_window_seconds", 60),
     )
 )
+
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(
+    os.getenv(
+        "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        _settings.get("circuit_breaker_failure_threshold", 5),
+    )
+)
+
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(
+    os.getenv(
+        "CIRCUIT_BREAKER_COOLDOWN_SECONDS",
+        _settings.get("circuit_breaker_cooldown_seconds", 30),
+    )
+)

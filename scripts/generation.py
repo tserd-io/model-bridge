@@ -3,6 +3,10 @@ import random
 import time
 from dataclasses import replace
 
+from scripts.circuit_breaker import (
+    CircuitBreaker, CircuitOpenError, CircuitPermit, CallOutcome,
+)
+
 from scripts.load_settings import MODEL_PREFERENCES
 from scripts.observability import (
     log_event,
@@ -44,7 +48,105 @@ async def complete_attempt(
             outcome_unknown=True,
             failure_type="timeout",
         ) from exc
-#def create_app():
+# Carries a rejected admission through the existing retryable-error API handler.
+class CircuitUnavailableError(RetryableProviderError):
+    def __init__(
+        self,
+        *,
+        attempts: int,
+        outcome_unknown: bool,
+        retry_after: int,
+        provider: str,
+        model: str,
+    ) -> None:
+        super().__init__(
+            "Provider circuit is temporarily unavailable",
+            attempts=attempts,
+            outcome_unknown=outcome_unknown,
+            failure_type="circuit_open",
+            status_code=503,
+            provider=provider,
+            model=model,
+        )
+        self.retry_after = retry_after
+
+
+# Counts transient backend outages while excluding rate limits and local bugs.
+def _counts_as_circuit_failure(error: RetryableProviderError) -> bool:
+    if error.status_code == 429 or error.failure_type == "http_429":
+        return False
+    return (
+        error.failure_type in {"timeout", "connection_error"}
+        or error.status_code in {408, 500, 502, 503, 504}
+    )
+
+
+# Completes an admitted call and releases its permit on every exit, including cancellation.
+async def _complete_admitted_attempt(
+    provider: Provider,
+    *,
+    breaker: CircuitBreaker | None,
+    permit: CircuitPermit | None,
+    provider_name: str,
+    request_id: str,
+    attempt: int,
+    message: str,
+    model_preference: str,
+    max_tokens: int,
+    timeout: float,
+    route: str,
+    tenant_id: str,
+) -> GenerationResult:
+    outcome: CallOutcome = "ignored"
+    try:
+        if breaker is not None and breaker.state == "half_open":
+            log_event(
+                "circuit_state_changed",
+                request_id=request_id,
+                provider=provider_name,
+                previous_state="open",
+                state="half_open",
+            )
+        log_event(
+            "provider_attempt_started",
+            request_id=request_id,
+            provider=provider_name,
+            model=_metric_model(provider_name, model_preference),
+            model_preference=model_preference,
+            route=route,
+            tenant=tenant_id,
+            attempt=attempt,
+            timeout_ms=round(timeout * 1000),
+        )
+        result = await complete_attempt(
+            provider,
+            request_id=request_id,
+            attempt=attempt,
+            message=message,
+            model_preference=model_preference,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        outcome = "success"
+        return result
+    except RetryableProviderError as exc:
+        outcome = "failure" if _counts_as_circuit_failure(exc) else "ignored"
+        raise
+    finally:
+        # Unknown/permanent errors and cancellation leave the default ignored outcome.
+        if breaker is not None and permit is not None:
+            transition = breaker.finish(permit, outcome)
+            if transition is not None:
+                previous, current = transition
+                log_event(
+                    "circuit_state_changed",
+                    request_id=request_id,
+                    provider=provider_name,
+                    previous_state=previous,
+                    state=current,
+                )
+
+
 # Coordinates generation attempts, deadlines, backoff, and a bounded provider fallback.
 async def llm_call(
     request_id: str,
@@ -56,6 +158,8 @@ async def llm_call(
     provider_name: str,
     fallback_provider: Provider | None = None,
     fallback_provider_name: str | None = None,
+    circuit_breaker: CircuitBreaker | None = None,
+    fallback_circuit_breaker: CircuitBreaker | None = None,
     route: str = "default",
     tenant_id: str = "default",
     timeout_seconds: float = 30,
@@ -69,11 +173,27 @@ async def llm_call(
         raise ValueError(
             "fallback_provider_name is required when a fallback provider is supplied"
         )
+    if fallback_circuit_breaker is not None and fallback_provider is None:
+        raise ValueError("A fallback breaker requires a fallback provider")
+    if fallback_provider is not None:
+        # Provider names identify backends in the current configuration.
+        if fallback_provider_name == provider_name or fallback_provider is provider:
+            if (
+                fallback_circuit_breaker is not None
+                and fallback_circuit_breaker is not circuit_breaker
+            ):
+                raise ValueError("The same backend must share one circuit breaker")
+            fallback_circuit_breaker = circuit_breaker
+        elif circuit_breaker is not None and fallback_circuit_breaker is None:
+            raise ValueError("A protected fallback requires its own circuit breaker")
+
     loop = asyncio.get_running_loop()
     deadline = loop.time() + request_deadline_seconds
     last_error: Exception | None = None
     active_provider = provider
     active_provider_name = provider_name
+    active_breaker = circuit_breaker
+    attempt = 0
     fallback_used = False
     any_outcome_unknown = False
 
@@ -87,35 +207,88 @@ async def llm_call(
             failure_type="deadline_exceeded",
         )
 
-    for attempt in range(1, max_attempts + 1):
+    # Selects fallback once without consuming a provider-call attempt.
+    def select_fallback(error_type: str, status_code: int) -> bool:
+        nonlocal active_provider, active_provider_name, active_breaker, fallback_used
+        if fallback_provider is None or fallback_used:
+            return False
+        record_fallback(
+            request_id,
+            active_provider_name,
+            _metric_model(active_provider_name, model_preference),
+            route,
+            tenant_id,
+            error_type,
+            status_code,
+            fallback_provider_name,
+        )
+        log_event(
+            "provider_fallback_selected",
+            request_id=request_id,
+            provider_from=active_provider_name,
+            provider_to=fallback_provider_name,
+            route=route,
+            tenant=tenant_id,
+            attempt=attempt + 1,
+            error_type=error_type,
+            status_code=status_code,
+        )
+        active_provider = fallback_provider
+        active_provider_name = fallback_provider_name
+        active_breaker = fallback_circuit_breaker
+        fallback_used = True
+        return True
+
+    while attempt < max_attempts:
         remaining_seconds = deadline - loop.time()
         if remaining_seconds <= 0:
-            raise deadline_error(attempt - 1) from last_error
+            raise deadline_error(attempt) from last_error
 
+        permit = None
+        if active_breaker is not None:
+            try:
+                permit = active_breaker.acquire()
+            except CircuitOpenError as exc:
+                # Admission rejection is not a provider call or a provider failure.
+                log_event(
+                    "circuit_call_rejected",
+                    request_id=request_id,
+                    provider=active_provider_name,
+                    retry_after=exc.retry_after,
+                    attempts=attempt,
+                )
+                if (
+                    fallback_circuit_breaker is not active_breaker
+                    and select_fallback("circuit_open", 503)
+                ):
+                    continue
+                raise CircuitUnavailableError(
+                    attempts=attempt,
+                    outcome_unknown=any_outcome_unknown,
+                    retry_after=exc.retry_after,
+                    provider=active_provider_name,
+                    model=_metric_model(active_provider_name, model_preference),
+                ) from exc
+
+        attempt += 1
         attempt_timeout = min(timeout_seconds, remaining_seconds)
         attempt_started = time.perf_counter()
         model_name = _metric_model(active_provider_name, model_preference)
-        log_event(
-            "provider_attempt_started",
-            request_id=request_id,
-            provider=active_provider_name,
-            model=model_name,
-            model_preference=model_preference,
-            route=route,
-            tenant=tenant_id,
-            attempt=attempt,
-            timeout_ms=round(attempt_timeout * 1000),
-        )
         try:
-            result = await complete_attempt(
+            result = await _complete_admitted_attempt(
                 active_provider,
+                breaker=active_breaker,
+                permit=permit,
+                provider_name=active_provider_name,
                 request_id=request_id,
                 attempt=attempt,
                 message=message,
                 model_preference=model_preference,
                 max_tokens=max_tokens,
                 timeout=attempt_timeout,
-                )
+                route=route,
+                tenant_id=tenant_id,
+            )
         except ProviderOutcomeUnknown as exc:
             # Stop further attempts because completion is explicitly uncertain; preserve the attempt count.
             _record_attempt(
@@ -162,32 +335,7 @@ async def llm_call(
                     provider=active_provider_name,
                     model=model_name,
                 ) from exc
-            if fallback_provider is not None and not fallback_used:
-                active_model = _metric_model(active_provider_name, model_preference)
-                record_fallback(
-                    request_id,
-                    active_provider_name,
-                    active_model,
-                    route,
-                    tenant_id,
-                    exc.failure_type,
-                    exc.status_code,
-                    fallback_provider_name,
-                )
-                log_event(
-                    "provider_fallback_selected",
-                    request_id=request_id,
-                    provider_from=active_provider_name,
-                    provider_to=fallback_provider_name,
-                    route=route,
-                    tenant=tenant_id,
-                    attempt=attempt + 1,
-                    error_type=exc.failure_type,
-                    status_code=exc.status_code,
-                )
-                active_provider = fallback_provider
-                active_provider_name = fallback_provider_name
-                fallback_used = True
+            if select_fallback(exc.failure_type, exc.status_code):
                 continue
 
             remaining_seconds = deadline - loop.time()

@@ -22,5 +22,7 @@
         "output": 30.0
     } },
   "rate_limit_requests": 3,
-  "rate_limit_window_seconds": 10
+  "rate_limit_window_seconds": 10,
+  "circuit_breaker_failure_threshold": 5,
+  "circuit_breaker_cooldown_seconds": 30
 }

@@ -117,7 +117,23 @@ class RequestStore:
                 raise IdempotencyConflictError(
                     "request_id was already used with a different payload"
                 )
-
+            # Atomically reacquires a request previously rejected before generation.
+            if row["status"] == "retryable":
+                connection.execute(
+                    """
+                    UPDATE requests
+                    SET status = 'in_progress',
+                        response_json = NULL,
+                        detail = NULL,
+                        attempts = 0,
+                        updated_at = ?,
+                        lease_expires_at = ?
+                    WHERE request_id = ? AND status = 'retryable'
+                    """,
+                    (now, now + lease_seconds, request_id),
+                )
+                connection.commit()
+                return RequestRecord(status="claimed")
             status = row["status"]
             detail = row["detail"]
             if status == "in_progress" and row["lease_expires_at"] <= now:
@@ -174,7 +190,15 @@ class RequestStore:
             detail=detail,
             attempts=attempts,
         )
-
+    # Preserves request identity while allowing retry after zero provider calls.
+    def mark_retryable(self, request_id: str, detail: str) -> None:
+        self._finish(
+            request_id,
+            status="retryable",
+            response_json=None,
+            detail=detail,
+            attempts=0,
+        )
     # Updates an in-progress request and rejects missing or already-finalized records.
     def _finish(
         self,

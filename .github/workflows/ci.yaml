@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    env:
+      LLM_PROVIDER: fake
+      LLM_FALLBACK_PROVIDER: ""
+      OPENAI_API_KEY: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes \
+            -r scripts/requirements-ci.lock
+          python -m pip check
+
+      - name: Lint
+        run: python -m ruff check scripts
+
+      - name: Run isolated tests
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/model-bridge"
+          export IDEMPOTENCY_DB_PATH="$RUNNER_TEMP/model-bridge/requests.sqlite3"
+
+          python -m pytest scripts/tests \
+            -o addopts= \
+            -q \
+            -p no:cacheprovider \
+            --basetemp="$RUNNER_TEMP/model-bridge/pytest" \
+            --disable-socket \
+            --allow-unix-socket

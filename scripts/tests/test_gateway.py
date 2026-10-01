@@ -20,6 +20,7 @@ from scripts.generation import llm_call
 from scripts.main import app
 from scripts.contracts import GenerationResult, RetryableProviderError
 from scripts.providers import FakeProvider
+from scripts.circuit_breaker import CircuitBreaker
 from scripts.request_store import RequestStore
 # Gives API tests fake providers and prevents configured fallback calls.
 @pytest.fixture(autouse=True)
@@ -28,6 +29,8 @@ def isolated_api_providers(monkeypatch):
     monkeypatch.setattr(main_module, "backup_provider", None)
     monkeypatch.setattr(main_module, "LLM_PROVIDER", "fake")
     monkeypatch.setattr(main_module, "FALLBACK_PROVIDER", None)
+    monkeypatch.setattr(main_module, "primary_breaker", CircuitBreaker())
+    monkeypatch.setattr(main_module, "backup_breaker", None)
 # Replaces only the limiter clock so tests can advance time without waiting.
 @pytest.fixture
 def limiter_clock(monkeypatch):
@@ -174,21 +177,16 @@ def request_payload(request_id: str, message: str = "hello") -> dict[str, object
     }
 
 
-# Substitutes a unique SQLite database for a test and removes its files afterward.
+# Gives each test its own SQLite database in pytest's temporary directory.
 @pytest.fixture
-def isolated_request_store(monkeypatch: pytest.MonkeyPatch):
-    database_path = Path.cwd() / f".pytest-requests-{uuid4().hex}.sqlite3"
+def isolated_request_store(monkeypatch, tmp_path):
+    database_path = tmp_path / "requests.sqlite3"
     monkeypatch.setattr(
         main_module,
         "request_store",
         RequestStore(database_path),
     )
-    try:
-        yield
-    finally:
-        # Remove the temporary database and its journal files even if the test fails.
-        for suffix in ("", "-wal", "-shm"):
-            database_path.with_name(database_path.name + suffix).unlink(missing_ok=True)
+    yield
 
 
 # Checks response fields and confirms duplicates replay the saved result without another provider call.
@@ -477,6 +475,38 @@ def test_evaluation_runner_persists_versions_labels_and_usage(
     assert result["known_failure_category"] == "instruction_following"
     assert result["grounding"]["faithfulness"] is None
     assert result["agentic_metrics"]["applicable"] is False
+
+
+# Checks shared API breaker state and prevents same-backend fallback bypass.
+@pytest.mark.parametrize("same_backend_fallback", [False, True])
+def test_api_shares_circuit_state_across_requests(
+    monkeypatch,
+    isolated_request_store,
+    same_backend_fallback,
+):
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30)
+    primary = SimpleNamespace(complete=AsyncMock(side_effect=RetryableProviderError(
+        "backend unavailable", status_code=503, failure_type="http_503"
+    )))
+    backup = RecordingFakeProvider()
+    monkeypatch.setattr(main_module, "primary_provider", primary)
+    monkeypatch.setattr(main_module, "primary_breaker", breaker)
+    monkeypatch.setattr(main_module, "RETRY_BASE_DELAY_SECONDS", 0)
+    if same_backend_fallback:
+        monkeypatch.setattr(main_module, "backup_provider", backup)
+        monkeypatch.setattr(main_module, "FALLBACK_PROVIDER", "fake")
+        monkeypatch.setattr(main_module, "backup_breaker", breaker)
+
+    with TestClient(app) as client:
+        first = client.post("/chat", json=request_payload("trip-circuit"))
+        second = client.post("/chat", json=request_payload("already-open-circuit"))
+
+    assert first.status_code == second.status_code == 503
+    assert first.json()["attempts"] == 1
+    assert second.json()["attempts"] == 0
+    assert breaker.state == "open"
+    assert primary.complete.await_count == 1
+    assert backup.calls == []
 
 
 # Checks HTTP 429, rounded Retry-After, and rejection before database or provider work.
