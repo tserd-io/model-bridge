@@ -1,7 +1,6 @@
 import asyncio
 import time
 import sqlite3
-#from typing import Literal
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
@@ -307,7 +306,6 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             exc.attempts,
             error_type="provider_rejection",
         )
-    # Unexpected failures may follow provider submission; preserve uncertainty.
     except Exception as exc:
         # Conservatively save unknown because an unexpected failure does not establish provider completion.
         await asyncio.to_thread(

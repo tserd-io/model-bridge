@@ -29,17 +29,22 @@ jobs:
 
       - name: Install locked dependencies
         run: |
-          python -m pip install pip-tools
-          python -m piptools compile \
-            --generate-hashes \
-            --output-file=scripts/requirements-ci.lock \
-            scripts/requirements-dev.txt
           python -m pip install --require-hashes \
             -r scripts/requirements-ci.lock
           python -m pip check
 
       - name: Lint
         run: python -m ruff check scripts --config .github/workflows/ruff.toml
+
+      - name: Audit dependencies
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/pip-audit"
+          "$RUNNER_TEMP/pip-audit/bin/python" -m pip install pip-audit
+          "$RUNNER_TEMP/pip-audit/bin/python" -m pip_audit \
+            --require-hashes \
+            --strict \
+            -r scripts/requirements-ci.lock
 
       - name: Run isolated tests
         shell: bash
@@ -54,3 +59,6 @@ jobs:
             --basetemp="$RUNNER_TEMP/model-bridge/pytest" \
             --disable-socket \
             --allow-unix-socket
+
+      - name: Check Uvicorn startup
+        run: python scripts/check_startup.py
