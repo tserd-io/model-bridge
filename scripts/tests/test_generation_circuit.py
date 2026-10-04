@@ -3,8 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
-import scripts.generation as generation
+from scripts import generation
 from scripts.circuit_breaker import CircuitBreaker
 from scripts.contracts import (
     GenerationResult,

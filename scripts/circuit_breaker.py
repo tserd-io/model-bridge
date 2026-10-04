@@ -2,7 +2,8 @@ import math
 import time
 from dataclasses import dataclass
 from threading import Lock
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Literal
 
 
 CircuitState = Literal["closed", "open", "half_open"]

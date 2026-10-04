@@ -24,5 +24,37 @@
   "rate_limit_requests": 3,
   "rate_limit_window_seconds": 10,
   "circuit_breaker_failure_threshold": 5,
-  "circuit_breaker_cooldown_seconds": 30
+  "circuit_breaker_cooldown_seconds": 30,
+  "storage": {
+    "path": "./data/gateway_requests.sqlite3",
+    "busy_timeout_seconds": 5,
+    "lease_margin_seconds": 5
+  },
+  "platform": {
+    "max_concurrent_jobs_per_instance": 5,
+    "max_input_bytes": 1048576,
+    "max_output_tokens": 8192,
+    "request_deadline_seconds": 45,
+    "shutdown_grace_seconds": 50,
+    "logging": {
+      "enabled": true,
+      "level": "info"
+    },
+    "metrics": {
+      "enabled": true
+    }
+  },
+  "tenant_defaults": {
+    "max_concurrent_jobs": 2,
+    "max_input_bytes": 1048576,
+    "request_deadline_seconds": 45
+  },
+  "tenant_overrides": {
+    "tenant-a": {
+      "max_concurrent_jobs": 3
+    },
+    "tenant-b": {
+      "max_input_bytes": 524288
+    }
+  }
 }

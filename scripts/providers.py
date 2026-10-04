@@ -4,6 +4,7 @@ from collections.abc import Awaitable
 from typing import TypeVar
 from ollama import AsyncClient, ResponseError
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+import httpx
 
 from scripts.load_settings import (
     LLM_PROVIDER,
@@ -81,24 +82,34 @@ class OllamaProvider:
                 ),
                 timeout,
             )
-        except asyncio.TimeoutError as exc:
-            # The response did not arrive in time; remote generation may still have completed.
+        except (
+            asyncio.TimeoutError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+        ) as exc:
+            # Classify transport timeouts while preserving uncertain completion.
             raise RetryableProviderError(
-				"Ollama request failed transiently",
-				outcome_unknown=True,
-				failure_type="timeout",
+                "Ollama request timed out",
+                outcome_unknown=True,
+                failure_type="timeout",
                 provider="ollama",
                 model=model,
-			) from exc
-        except ConnectionError as exc:
-            # Treat connection failures as retryable while retaining uncertainty about remote completion.
+            ) from exc
+
+        except (
+            ConnectionError,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            # Classify network failures and invalid remote responses as transient.
             raise RetryableProviderError(
-				"Ollama connection failed",
-				outcome_unknown=True,
-				failure_type="connection_error",
+                "Ollama transport failed",
+                outcome_unknown=True,
+                failure_type="connection_error",
                 provider="ollama",
                 model=model,
-			) from exc
+            ) from exc
         except ResponseError as exc:
             # Translate transient HTTP statuses into retryable errors; only 429 is treated as a definite rejection here.
             if is_retryable_status_code(exc.status_code):

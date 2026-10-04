@@ -1,5 +1,4 @@
-# ruff.toml
 target-version = "py312"
 
 [lint]
-select = ["E9", "F63", "F7", "F82"]
+select = ["E9", "F"]

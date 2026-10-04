@@ -13,10 +13,10 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from scripts.load_settings import LLM_PROVIDER, MAX_LLM_ATTEMPTS
-import scripts.generation as generation
+#import scripts.generation as generation
 import scripts.main as main_module
 from scripts.generation import llm_call
-from scripts.main import app
+#from scripts.main import app
 from scripts.contracts import GenerationResult, RetryableProviderError
 from scripts.providers import (
     OpenAIProvider,
@@ -24,7 +24,7 @@ from scripts.providers import (
     is_retryable_status_code,
     run_with_attempt_timeout,
 )
-from scripts.schemas import ChatRequest
+#from scripts.schemas import ChatRequest
 from scripts.request_store import RequestStore
 
 PROMPT_TEXT = "Reply with exactly: Ollama is working."

@@ -1,14 +1,14 @@
 import asyncio
 import time
 import sqlite3
-from typing import Literal
+#from typing import Literal
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from scripts.schemas import ChatRequest, ChatResponse
-from scripts.generation import CircuitUnavailableError, llm_call
-from scripts.observability import log_event, record_request
+from scripts.generation import llm_call
+from scripts.observability import log_event
 from scripts.request_store import IdempotencyConflictError, RequestStore
 from scripts.rate_limit import SlidingWindowRateLimiter
 from scripts.providers import create_provider
@@ -233,7 +233,7 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             exc.attempts,
             error_type="unknown_outcome",
         )
-    except asyncio.TimeoutError as exc:
+    except asyncio.TimeoutError:
         # Conservatively save an unknown outcome with zero attempts because this exception has no count.
         await asyncio.to_thread(
             request_store.mark_unknown,
@@ -250,71 +250,6 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             started_at,
             error_type="timeout",
             timed_out=True,
-        )
-    except CircuitUnavailableError as exc:
-        # Earlier uncertain work must never become automatically retryable.
-        if exc.outcome_unknown:
-            await asyncio.to_thread(
-                request_store.mark_unknown,
-                request.request_id,
-                UNKNOWN_OUTCOME_DETAIL,
-                exc.attempts,
-            )
-            return _state_result(
-                request,
-                route,
-                "unknown",
-                UNKNOWN_OUTCOME_DETAIL,
-                202,
-                started_at,
-                exc.attempts,
-                error_type="circuit_open",
-            )
-
-        if exc.attempts == 0:
-            detail = (
-                "Provider temporarily unavailable; no provider call was made. "
-                "Retry this request after the indicated delay."
-            )
-            await asyncio.to_thread(
-                request_store.mark_retryable,
-                request.request_id,
-                detail,
-            )
-            response = _state_result(
-                request,
-                route,
-                "failed",
-                detail,
-                503,
-                started_at,
-                0,
-                error_type="circuit_open",
-            )
-            response.headers["Retry-After"] = str(exc.retry_after)
-            return response
-
-        # Preserve the existing terminal-failure policy after actual,
-        # definitively failed calls; do not advertise same-ID retry.
-        detail = (
-            "Provider temporarily unavailable after failed provider attempts. "
-            "This request has been recorded as failed."
-        )
-        await asyncio.to_thread(
-            request_store.mark_failed,
-            request.request_id,
-            detail,
-            exc.attempts,
-        )
-        return _state_result(
-            request,
-            route,
-            "failed",
-            detail,
-            503,
-            started_at,
-            exc.attempts,
-            error_type="circuit_open",
         )
     except RetryableProviderError as exc:
         # Use accumulated uncertainty to choose unknown/202 or failed/503 and preserve the attempt count.
@@ -372,6 +307,7 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
             exc.attempts,
             error_type="provider_rejection",
         )
+    # Unexpected failures may follow provider submission; preserve uncertainty.
     except Exception as exc:
         # Conservatively save unknown because an unexpected failure does not establish provider completion.
         await asyncio.to_thread(

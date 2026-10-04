@@ -29,12 +29,17 @@ jobs:
 
       - name: Install locked dependencies
         run: |
+          python -m pip install pip-tools
+          python -m piptools compile \
+            --generate-hashes \
+            --output-file=scripts/requirements-ci.lock \
+            scripts/requirements-dev.txt
           python -m pip install --require-hashes \
             -r scripts/requirements-ci.lock
           python -m pip check
 
       - name: Lint
-        run: python -m ruff check scripts
+        run: python -m ruff check scripts --config .github/workflows/ruff.toml
 
       - name: Run isolated tests
         shell: bash

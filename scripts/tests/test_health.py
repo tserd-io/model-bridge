@@ -13,7 +13,7 @@ def health_app(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "")
     monkeypatch.setenv("IDEMPOTENCY_DB_PATH", str(database_path))
 
-    import scripts.main as main
+    from scripts import  main
     from scripts.request_store import RequestStore
 
     monkeypatch.setattr(main, "request_store", RequestStore(database_path))
