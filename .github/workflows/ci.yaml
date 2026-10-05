@@ -62,3 +62,63 @@ jobs:
 
       - name: Check Uvicorn startup
         run: python -m tests.check_startup
+  docker-smoke:
+    name: Docker build and startup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build --tag model-bridge:ci .
+
+      - name: Start container
+        run: |
+          docker run --detach \
+            --name model-bridge-ci \
+            --env LLM_PROVIDER=fake \
+            --env LLM_FALLBACK_PROVIDER= \
+            model-bridge:ci
+
+      - name: Wait for container health
+        shell: bash
+        run: |
+          for attempt in {1..60}; do
+            state=$(docker inspect --format '{{.State.Status}}' model-bridge-ci)
+            health=$(docker inspect --format '{{.State.Health.Status}}' model-bridge-ci)
+
+            echo "Attempt ${attempt}: state=${state}, health=${health}"
+
+            if [[ "$state" != "running" ]]; then
+              echo "::error::Container stopped before becoming healthy."
+              exit 1
+            fi
+
+            case "$health" in
+              healthy)
+                exit 0
+                ;;
+              unhealthy)
+                echo "::error::Container health check failed."
+                exit 1
+                ;;
+            esac
+
+            sleep 2
+          done
+
+          echo "::error::Timed out waiting for container health."
+          exit 1
+
+      - name: Show container diagnostics
+        if: failure()
+        run: |
+          docker logs model-bridge-ci || true
+          docker inspect model-bridge-ci || true
+
+      - name: Remove container
+        if: always()
+        run: docker rm --force model-bridge-ci || true

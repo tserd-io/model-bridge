@@ -2,14 +2,9 @@
 
 Last reviewed against source: 2026-10-05.
 
-Model Bridge is a Python gateway that exposes one API for calling LLM
-providers. It selects models, controls generation attempts, records
-request outcomes, and evaluates responses against a versioned dataset.
-
-Use this overview as a starting map for diagnostics and code review.
-Verify relevant implementation and tests before drawing conclusions;
-this document describes the source at the review date, not a guarantee
-of current behavior or a record of passing tests.
+Model Bridge provides one API for calling LLM providers. It chooses models,
+limits work, saves request results, and measures response quality. This
+overview describes its current behavior and remaining work.
 
 ## Source map
 
@@ -21,39 +16,39 @@ caches, and local SQLite files are omitted from this map.
 ```text
 model-bridge/
 ├─ model_bridge/
-│  ├─ main.py                     # Service construction and application factory
+│  ├─ main.py                     # Builds the service and FastAPI app
 │  ├─ api/
 │  │  ├─ chat.py                  # Chat HTTP route
 │  │  ├─ health.py                # Liveness and readiness routes
-│  │  ├─ dependencies.py          # Trusted tenant and service dependencies
-│  │  ├─ schemas.py               # Public request and response models
-│  │  └─ responses.py             # Outcome-to-HTTP conversion
+│  │  ├─ dependencies.py          # Supplies tenant identity and chat service
+│  │  ├─ schemas.py               # Checks request and response fields
+│  │  └─ responses.py             # Turns service results into HTTP responses
 │  ├─ application/
-│  │  ├─ chat_service.py          # Routing, admission, replay and generation workflow
-│  │  └─ outcomes.py              # Plain command, result and outcome dataclasses
+│  │  ├─ chat_service.py          # Coordinates the chat request
+│  │  └─ outcomes.py              # Request and result data classes
 │  ├─ providers/
-│  │  ├─ contracts.py             # Provider protocol, results and exceptions
-│  │  ├─ factory.py               # Adapter construction from explicit settings
+│  │  ├─ contracts.py             # Shared provider interface and errors
+│  │  ├─ factory.py               # Creates providers from settings
 │  │  ├─ ollama.py
 │  │  ├─ openai.py
 │  │  ├─ fake.py
 │  │  ├─ pricing.py               # Token-cost calculation
-│  │  └─ transport.py             # Shared timeout and status classification
+│  │  └─ transport.py             # Timeouts and retryable error checks
 │  ├─ execution/
-│  │  ├─ generation.py            # Attempts, deadlines, fallback and circuit admission
+│  │  ├─ generation.py            # Retries, timeouts, fallback and breaker checks
 │  │  ├─ circuit_breaker.py
 │  │  ├─ rate_limit.py
 │  │  └─ concurrency_limit.py
 │  ├─ storage/
-│  │  └─ request_store.py         # SQLite tenant/request state and replay
+│  │  └─ request_store.py         # Saves requests and returns stored results
 │  ├─ config/
 │  │  ├─ loader.py                # JSON loading and environment overrides
 │  │  ├─ models.py                # Validated settings
 │  │  └─ config.json
 │  ├─ observability/
 │  │  ├─ logging.py               # Timestamped JSON events
-│  │  ├─ metrics.py               # Counters, histograms and active generation gauge
-│  │  └─ labels.py                # Bounded tenant labels and label normalization
+│  │  ├─ metrics.py               # Counts requests, latency and active work
+│  │  └─ labels.py                # Limits tenant labels in metrics
 │  └─ evaluations/
 │     ├─ README.md                # Evaluation usage and dataset format
 │     ├─ eval_runner.py
@@ -62,27 +57,27 @@ model-bridge/
 │     └─ datasets/
 │        └─ golden_dataset.json
 ├─ tests/
-│  ├─ conftest.py                 # Shared fixtures and isolated test services
-│  ├─ testing_app.py              # Fake-provider app factory with simulated identity
-│  ├─ check_startup.py            # Actual Uvicorn startup check
+│  ├─ conftest.py                 # Shared test setup and temporary services
+│  ├─ testing_app.py              # Test app with fake provider and identity
+│  ├─ check_startup.py            # Starts and checks a Uvicorn server
 │  ├─ smoke_test.py               # Manual local checks; --live opts into a provider call
-│  ├─ test_chat_responses.py      # Outcome-to-HTTP status, body and headers
-│  ├─ test_chat_service.py        # Direct service execution and tenant-scoped replay
-│  ├─ test_circuit_breaker.py      # Circuit state transitions
-│  ├─ test_concurrency_limits.py   # Generation capacity and retryable rejection
-│  ├─ test_evaluation.py          # Evaluation aggregation and output
-│  ├─ test_gateway.py             # Routing, retries, persistence and replay
-│  ├─ test_generation_circuit.py  # Breaker admission during provider execution
+│  ├─ test_chat_responses.py      # Response codes, data and headers
+│  ├─ test_chat_service.py        # Service calls and saved results per tenant
+│  ├─ test_circuit_breaker.py      # Breaker opening, cooldown and recovery
+│  ├─ test_concurrency_limits.py   # Capacity limits and retries after rejection
+│  ├─ test_evaluation.py          # Evaluation summaries and files
+│  ├─ test_gateway.py             # Routing, retries and stored results
+│  ├─ test_generation_circuit.py  # Breaker checks around provider calls
 │  ├─ test_health.py              # Liveness and database readiness
 │  ├─ test_input_limits.py        # Message length and HTTP body limits
-│  └─ test_tenant_concurrency.py  # Tenant capacity, identity and shared platform limits
+│  └─ test_tenant_concurrency.py  # Tenant identity and capacity limits
 ├─ requirements.txt              # Application dependencies
-├─ requirements-dev.txt          # Development dependencies; includes requirements.txt
-├─ requirements-ci.lock          # Pinned, hashed dependencies for CI
-├─ data/                          # Runtime database and evaluation output; ignored by Git
+├─ requirements-dev.txt          # Development tools and application dependencies
+├─ requirements-ci.lock          # Exact versions and download hashes for CI
+├─ data/                          # Database and evaluation results; ignored by Git
 ├─ .github/
 │  └─ workflows/
-│     ├─ ci.yaml                  # Dependency, lint, audit, test and startup checks
+│     ├─ ci.yaml                  # Installation, lint, security and test checks
 │     └─ ruff.toml                # CI lint rules
 ├─ .gitignore
 ├─ pytest.ini
@@ -90,357 +85,275 @@ model-bridge/
 └─ SYSTEM_OVERVIEW.md
 ```
 
-## Main components
 
-| Module or package | Responsibility |
+## How the parts fit together
+
+`main.py` builds the FastAPI app and a `ChatService`. The API checks input
+and identity, then passes a request to the service. The service chooses a
+model, applies limits, calls providers, and saves the result. It returns
+plain data; `api/responses.py` adds the HTTP status and headers.
+
+Providers share an asynchronous `complete()` interface that returns a
+`GenerationResult`. Each adapter translates its provider's responses and
+errors into these shared types:
+
+- **Ollama:** local models and reported token usage.
+- **OpenAI:** hosted models, request-tracing headers, token usage, and
+  estimated costs when pricing is configured. SDK retries are disabled
+  so the gateway controls the number of attempts.
+- **Fake:** predictable responses without external model calls.
+
+`config/` loads JSON settings and environment overrides. Relative storage
+paths resolve from the repository root. Tenant settings inherit defaults
+and cannot exceed configured platform limits. Unknown tenants use defaults;
+the settings file does not determine who is allowed to access the API.
+
+## What happens to a chat request
+
+1. **Check input and identity.** Enforce request-body and message-length
+   limits. Use the trusted tenant identity instead of the body's tenant ID.
+2. **Choose a model.** Simple tasks use `fast`; complex and high-risk tasks
+   use `balanced`. Otherwise, use the requested model preference.
+3. **Check the rate limit.** Too many requests receive HTTP 429 with
+   `Retry-After`, before database or provider work.
+4. **Check stored requests.** Look up `(tenant_id, request_id)` and compare
+   the validated input. Return a saved result, existing state, or conflict
+   when appropriate.
+5. **Check generation capacity.** New work must fit both the tenant and
+   process limits. A full limit returns HTTP 503 with `Retry-After: 1`.
+   Saved responses skip this check but still pass the rate limit.
+6. **Call the provider.** Check the circuit breaker and apply timeouts.
+   Retries and fallback share the original deadline and attempt limit.
+7. **Save and return the result.** Store successful responses for later
+   reuse, record failures or uncertain results, and emit logs and metrics.
+
+High-risk routing sets `human_review_required`; there is no human approval
+workflow yet.
+
+## Tenant identity and limits
+
+A tenant represents a caller or customer whose requests should be kept
+separate. Chat requires an `AuthenticatedTenant` in
+`request.state.authenticated_tenant`. Authentication is deliberately left
+open-ended: the production app does not establish this identity, so valid
+chat requests currently receive HTTP 401 unless trusted identity is supplied.
+A tenant ID in the request body cannot establish identity.
+
+Tests supply identities through dependency overrides.
+`tests.testing_app:create_test_app` supplies a test identity and requires a
+fake provider, no fallback, and an explicit storage path.
+
+The concurrency limiter checks tenant and process capacity together and
+rejects excess work immediately. It releases capacity after success,
+failure, or cancellation, and removes unused tenant counters. A slot covers
+provider attempts and retry delays, but not input parsing or database work.
+
+Rate limits, concurrency counts, and circuit breakers are held in each
+process. Multiple workers or replicas have separate limits and state.
+These limits reduce memory pressure; they do not set a hard tenant memory
+budget or limit the amount of data retained in SQLite.
+
+Some settings are validated but not yet used:
+
+| Setting | Current behavior |
 |---|---|
-| `model_bridge/main.py` | Constructs the chat service and registers HTTP routers through `create_app()`. |
-| `model_bridge/api/` | Validates HTTP input, obtains trusted tenant identity, converts outcomes and exposes health probes. |
-| `model_bridge/application/chat_service.py` | Coordinates routing, admission, idempotency, provider execution and outcome persistence. |
-| `model_bridge/application/outcomes.py` | Defines `ChatCommand`, `ChatResult` and `ChatOutcome` without HTTP framework types. |
-| `model_bridge/providers/` | Defines the provider contract, configured adapter factory, real/fake adapters and transport helpers. |
-| `model_bridge/execution/` | Coordinates generation and process-local circuit, rate and concurrency policies. |
-| `model_bridge/storage/request_store.py` | Claims tenant/request identities and persists processing states and responses. |
-| `model_bridge/config/` | Loads and validates configuration while preserving repository-root storage resolution. |
-| `model_bridge/observability/` | Emits structured events and bounded Prometheus instrumentation. |
-| `model_bridge/evaluations/` | Runs, scores, summarizes and writes versioned evaluations. |
+| Tenant and platform concurrency | Enforced during generation. |
+| Platform body bytes and message length | Enforced before generation. |
+| Platform deadline and rate limit | Applied by the chat service. |
+| Tenant body bytes, output tokens, deadline, and rate limit | Validated, but not enforced by the chat service. |
+| Platform output-token limit | The request schema uses a fixed maximum of 8192. |
+| Metrics enabled and tenant labels | Applied; tenant labels are limited to an allowlist. |
+| Logging switches and shutdown grace | Not connected to runtime behavior. |
+| Storage busy timeout and lease margin | Still use fixed five-second values. |
 
-`create_app()` stores an injected `ChatService` in `app.state.chat_service`.
-The API dependency retrieves that service; route modules do not import
-`main.py`. The service returns plain outcomes, and `api/responses.py`
-maps them to the public response schema, status codes and headers.
-Tests and the smoke runner replace service dependencies rather than
-module globals. Authentication remains deliberately deferred.
+## Stored requests and duplicate handling
 
-## Request lifecycle
+Request keys combine **tenant ID and request ID**, so two tenants can use
+the same request ID without a collision. Within one tenant:
 
-1. **Check input and identity.** Body-limit middleware caps request bytes;
-   FastAPI and Pydantic validate fields, including maximum message length.
-   The chat dependency requires a trusted tenant identity. The handler
-   replaces the body's tenant ID with that identity and resolves its policy.
-2. **Choose a route.** Simple tasks select `fast`; complex and high-risk
-   tasks select `balanced`. Without a task type, the requested model
-   preference is used.
-3. **Apply the rate limit.** Rejected requests receive HTTP 429 and a
-   `Retry-After` header before database or provider work begins.
-4. **Claim the request.** SQLite checks the tenant/request composite key
-   and a hash of the validated payload. Existing requests may return a saved result,
-   pending state, uncertain outcome, or conflict.
-5. **Acquire capacity.** New generation must fit both the process limit
-   and the authenticated tenant's limit. Saturation returns HTTP 503 with
-   `Retry-After: 1` and saves a retryable request state. Saved-response
-   replay bypasses generation capacity, but still passes the rate limit.
-6. **Generate a response.** The generation runner checks circuit
-   admission and invokes the provider with a bounded attempt timeout.
-   Retryable failures may trigger fallback or backoff within the
-   original generation deadline and attempt budget.
-7. **Persist the outcome.** Successful responses are saved for replay.
-   Failures are classified as definite or uncertain.
-8. **Return and record.** The API returns a normalized response and
-   records completion metrics and logs.
+- Repeating a successful request with the same validated input returns its
+  saved response, with `cache_hit=true` and `X-Idempotent-Replay: true`.
+- Reusing that ID with different input returns HTTP 409.
+- Capacity rejection saves a `retryable` state that a matching request can
+  claim again.
+- `unknown` means the provider may have completed the work. Repeating the
+  request does not automatically generate again.
 
-High-risk routing sets `human_review_required`; it does not implement
-a human approval workflow.
+This duplicate handling is called **idempotency**. It does not guarantee
+that an external provider runs each request exactly once.
 
-## Tenant identity, capacity, and configuration
+SQLite transactions coordinate request claims. Each running request has a
+time limit for recording its result, called a processing lease. If that
+lease expires, the request becomes `unknown` when checked again.
 
-Every chat request requires an `AuthenticatedTenant` in
-`request.state.authenticated_tenant`. The production app currently has
-no authenticator that populates this state, so otherwise valid chat
-requests receive HTTP 401. A client-supplied tenant ID is not proof of
-identity. Connecting verified credentials to a tenant remains necessary.
+Startup creates missing databases and tables. The prototype database was
+reset and the tenant/request primary key verified. Existing incompatible
+tables are neither migrated nor rejected at startup. Data cleanup and
+consistent handling of database failures remain unfinished, including
+failures while saving an already-generated response.
 
-Tests supply identity through dependency overrides. The explicit
-`tests.testing_app:create_test_app` factory also supplies a test
-identity, and requires a fake provider, no fallback, and an explicit
-storage path. It is a test entry point, not production authentication.
+## Retries, fallback, and the circuit breaker
 
-The generation limiter checks both counters under one lock, rejects
-immediately when full, and releases capacity on success, failure, or
-cancellation. A slot covers generation attempts and retry delays; it
-does not cover body parsing, database claims, or final result writes.
-Empty tenant counters are removed. Limits apply per process: multiple
-workers or replicas multiply capacity unless admission is coordinated.
-Concurrency and input limits reduce memory pressure but do not provide
-a hard per-tenant RAM budget or bound retained database data.
+Generation separates temporary failures, definite rejections, and uncertain
+results. A timeout does not prove that remote work stopped; retrying or
+falling back after an uncertain result can duplicate that work.
 
-The settings loader validates JSON and supported environment overrides,
-resolves storage paths against the project root, and exposes both typed
-settings and legacy constants. Tenant overrides inherit defaults and
-are validated against platform ceilings. Unknown tenant IDs receive
-default policy; configuration is not an authorization registry.
+The default primary and fallback both use the same Ollama host and model
+mapping. A fallback that can survive that backend failing needs a different
+configuration.
 
-Runtime enforcement is still partial:
+The circuit breaker stops repeatedly calling a failing backend:
 
-| Setting | Current enforcement |
+| State | Behavior |
 |---|---|
-| Platform and tenant concurrency | Enforced around generation. |
-| Platform input bytes and message characters | Enforced by middleware and request validation. |
-| Tenant input bytes, output tokens, deadline, and rate limit | Defined and validated, but not applied by the chat service. |
-| Platform output tokens | Request schema still hardcodes a maximum of 8192 instead of reading this setting. |
-| Platform deadline and rate limit | Injected into the chat service from validated settings. |
-| Metrics enabled | Controls application metric recording and metrics endpoint registration. |
-| Tenant metric labels | Disabled by default; enabled labels use a bounded allowlist and an `other` bucket. |
-| Logging switches and shutdown grace | Defined but not wired into runtime behavior. |
-| Storage busy timeout and lease margin | Runtime still uses literal five-second values. |
+| Closed | Allow calls and count qualifying failures. |
+| Open | Reject calls during a cooldown. |
+| Half-open | Allow one call to check whether the backend recovered. |
 
-Validated settings describe policy. Check their consumers before assuming
-that every configured tenant allowance or operational switch is enforced.
+A successful recovery call closes the breaker. A failed or cancelled one
+starts another cooldown. Old call results cannot overwrite newer breaker
+state. Primary and fallback share a breaker when they use the same configured
+backend; rejected calls do not count as provider attempts.
 
-## Provider abstraction
+One API integration issue remains: `CircuitUnavailableError` uses the generic
+retryable-error handler. A rejection before any provider call is saved as a
+final failure, and its retry delay is not passed to the client.
 
-Each provider implements an asynchronous `complete()` method and
-returns `GenerationResult`.
+## Logs, metrics, and health
 
-The adapters translate provider-specific responses and errors into
-shared types. This lets generation and API code work with a consistent
-interface.
+SQLite stores request input and successful responses. JSON logs include UTC
+timestamps to the millisecond, request IDs, routes, attempts, outcomes, and
+latency. Request and provider-call events include tenant identity. Logs omit
+prompt and response content.
 
-- **Ollama:** local model calls and reported token usage.
-- **OpenAI:** hosted model calls, request-correlation headers, token
-  usage, and estimated cost where pricing is configured.
-- **Fake provider:** predictable responses without external calls.
+When enabled, `/metrics/` reports requests, errors, retries, fallback,
+latency, saved-response reuse, available token usage, and estimated cost.
+`llm_active_generations` counts jobs holding generation capacity in the
+current process, including retry delays. It decreases when work completes,
+fails, or is cancelled. Disabling metrics stops recording and removes the
+endpoint. Storage-failure metrics are not implemented.
 
-OpenAI SDK retries are disabled so the gateway owns the retry budget.
+Tenant labels are disabled by default, so all tenants use `all`. When
+enabled, up to 100 configured tenants get individual labels; everyone else
+uses `other`. Each distinct label adds metric series, which consume memory.
+The allowlist prevents unbounded growth as new tenants appear.
 
-## Reliability and request state
+Token and cost estimates depend on available provider data and pricing;
+they are not a complete record of all remote work or charges.
 
-### Idempotency
-
-Requests are identified by the composite key `(tenant_id, request_id)`.
-The handler obtains tenant identity from its trusted dependency before
-claiming or updating storage. Different tenants can reuse the same
-request ID without colliding.
-
-Within one tenant, repeating a successful request with the same ID and
-validated payload returns the saved response with `cache_hit=true` and
-an `X-Idempotent-Replay: true` header. Reusing that ID with different
-input returns HTTP 409.
-
-Startup creates the database and requests table when absent. Disposable
-prototype storage was reset, and application startup verified the new
-composite primary key. Automatic schema migration and startup rejection
-of incompatible existing tables are not implemented.
-
-SQLite uses transactions to coordinate request claims. Processing
-leases identify work that did not record a final result; expired
-in-progress requests become `unknown` when checked again.
-
-Requests rejected for generation capacity use `retryable`; a later
-matching claim can atomically reacquire them. There is no retention
-cleanup. Database claim and final-write failures do not yet have a
-consistent API recovery policy, including failed saves after generation.
-
-An unknown result means generation may have completed remotely.
-Replaying that request does not automatically start generation again.
-This does not guarantee exactly-once execution at an external provider.
-
-### Retries and fallback
-
-Generation distinguishes transient failures, permanent rejections,
-and uncertain outcomes. Retry and fallback attempts share a deadline
-and attempt budget.
-
-Fallback after an uncertain failure can duplicate remote work.
-A timeout does not prove that the provider stopped processing.
-
-The default configuration selects Ollama for both primary and fallback
-using the same model mapping and host. An independent recovery path
-requires different configuration.
-
-### Circuit breaker
-
-The breaker has three states:
-
-- **Closed:** calls are admitted and qualifying failures are counted.
-- **Open:** calls are rejected during a cooldown.
-- **Half-open:** one recovery probe is admitted.
-
-A successful probe closes the circuit. An unsuccessful or cancelled
-probe starts another cooldown. Results from older circuit generations
-cannot overwrite newer state.
-
-Same-backend primary and fallback adapters share a breaker.
-Circuit rejections do not count as actual provider attempts.
-
-Rate limiting, circuit state, and concurrency counters are process-local.
-Rate limiting controls admission frequency; concurrency separately limits
-active generation jobs.
-
-The chat service still catches `CircuitUnavailableError` through the generic
-retryable-provider handler. A circuit rejection before any provider call
-is stored as a terminal failure, without forwarding its retry delay.
-This integration gap is separate from the breaker's state-machine tests.
-
-## Storage, logs, and health
-
-SQLite stores request payloads and successful responses. Operational
-JSON logs include explicit UTC timestamps with millisecond precision,
-request IDs, routes, attempts, outcomes, and latency. Request and
-provider-attempt events include tenant identity. Operational events
-omit prompt and response content.
-
-When metrics are enabled, `/metrics/` exposes request counts, errors,
-retries, fallback, latency, cache hits, available token usage, and
-estimated cost. `llm_active_generations` measures generation jobs holding
-capacity in the current process. It includes retry delays and releases
-on success, failure, or cancellation.
-
-Tenant metric labels are bounded. With tenant labels disabled, all
-tenants use `all`. When enabled, configured allowlisted tenants receive
-individual labels; other tenants use `other`. The allowlist is limited
-to 100 entries.
-
-Disabling metrics stops application metric recording and omits the
-metrics endpoint. Dedicated storage-failure metrics remain
-unimplemented. Usage and cost estimates are not a complete ledger of
-remote work.
-
-| Endpoint | Meaning |
+| Endpoint | What it checks |
 |---|---|
 | `GET /health/live` | The application can respond. |
-| `GET /health/ready` | The existing requests table can be read. |
+| `GET /health/ready` | The existing SQLite requests table can be read. |
 
-Readiness opens SQLite read-only, so it does not create a missing
-database. It checks that the requests table can be read, but does not
-validate its complete schema, database writes, or provider availability.
-An incompatible table may therefore pass readiness and fail chat requests.
+Readiness opens SQLite read-only and does not create a missing database.
+It does not check the full table structure, database writes, or provider
+availability. An incompatible table can pass readiness while chat fails.
 
-## Evaluation pipeline
+## Evaluations
 
-Evaluation is split into three modules under `model_bridge/evaluations/`:
+Evaluations use a versioned dataset to measure response quality and performance.
+The work is split under `model_bridge/evaluations/`:
 
 | Module | Responsibility |
 |---|---|
-| `eval_runner.py` | Reads the dataset, sends requests through a supplied client, and scores each case. |
-| `eval_summary.py` | Calculates aggregate metrics from scored records. |
-| `eval_writer.py` | Writes per-case JSONL and summary JSON files. |
+| `eval_runner.py` | Read prompts, send requests through a supplied client, and score answers. |
+| `eval_summary.py` | Summarize scores, latency, errors, usage, and available cost. |
+| `eval_writer.py` | Save per-case JSONL and summary JSON files. |
 
-Scoring supports allowed answers, required answer points, and expected
-JSON fields. Summaries include quality scores, latency percentiles,
-availability, error rates, token totals, and available cost estimates.
+Scoring checks allowed answers, required answer points, or expected JSON
+fields. Dataset and prompt versions identify what was evaluated. Checks for
+source-grounded answers and tool use remain placeholders because the gateway
+does not retrieve source material or execute tools.
 
-Dataset and prompt versions identify what was evaluated. Grounding
-and agentic metrics remain placeholders because the gateway does not
-provide retrieval evidence or execute tools.
-
-Run the evaluation CLI from the repository root:
+Run from the repository root:
 
 ```sh
 python -m model_bridge.evaluations.eval_runner
 ```
 
-The CLI creates its own local API client and uses the configured
-provider. New results are written under `data/evaluation_runs/`, outside
-the application package. Programmatic callers supply the client and manage its lifetime.
-The CLI currently supplies no authenticated identity, so its chat calls
-receive 401 until authentication is integrated. Successful evaluation
-tests use an application client with a test identity; they do not prove
-the standalone CLI can generate responses.
+The CLI creates a local API client and writes results to
+`data/evaluation_runs/`. It currently supplies no trusted tenant identity,
+so chat calls receive 401. Evaluation tests supply a test identity;
+programmatic callers supply and manage their own client.
 
-## What the tests demonstrate
+## Tests and manual checks
 
-Test files are under `tests/`.
+Tests in `tests/` cover routing, retries, fallback, stored responses, tenant
+keys, circuit breakers, rate and concurrency limits, input limits, health,
+HTTP responses, and evaluation summaries. The source map identifies each file.
 
-| Test file | Coverage |
-|---|---|
-| `test_gateway.py` | Response normalization, saved-response replay, conflicting IDs, routing, retries, fallback, unknown outcomes, rate-limit headers, concurrent limiter admission, shared circuit state, and evaluation output. |
-| `test_circuit_breaker.py` | Failure thresholds, success resets, cooldown, single recovery-probe admission, stale completion handling, and duplicate permit completion. |
-| `test_generation_circuit.py` | Circuit integration with generation, fallback, attempt counting, uncertainty, deadlines, cancellation, and error classification. |
-| `test_health.py` | Liveness independence, readable storage, missing/corrupt/schema-less databases, and recovery after storage is restored. |
-| `test_evaluation.py` | Aggregation of saved results, including mixed outcomes and incomplete cost information. |
-| `test_concurrency_limits.py` | Capacity saturation and recovery, simultaneous admission, release on failure/cancellation, retryable rejection, and replay at full capacity. |
-| `test_input_limits.py` | Character and byte boundaries, Unicode messages, chunked bodies, missing/misleading content lengths, and oversized invalid JSON. |
-| `test_tenant_concurrency.py` | Tenant and platform ceilings, atomic admission, cleanup on cancellation, policy overrides, body-tenant spoofing resistance, and unauthenticated rejection. |
-| `tests/smoke_test.py` | Manual checks for adapter behavior, tracing headers, retries, timeouts, deadlines, and idempotency. |
-| `test_chat_responses.py` | HTTP status, response data, retry guidance and replay headers for application outcomes. |
-| `test_chat_service.py` | Direct service execution and tenant-scoped replay without an HTTP client. |
+They use fake providers, controlled clocks, mocks, and temporary databases.
+`conftest.py` supplies a default test identity; identity-specific tests replace
+it. Importing the application still constructs its configured providers and
+store, so use fake-provider settings and a temporary `IDEMPOTENCY_DB_PATH`
+before importing it for isolated checks.
 
-Automated tests use fake providers, controlled clocks, mocks, and
-temporary databases to check gateway behavior without requiring
-live model responses. Set the fake provider and a temporary
-`IDEMPOTENCY_DB_PATH` before importing the application, which constructs
-its configured providers and request store at import time.
-`conftest.py` supplies a default test identity for ordinary API tests;
-identity-specific tests control that dependency themselves.
+Run from the repository root:
 
-These tests verify selected behaviors. They do not establish model
-quality, production load capacity, tenant isolation, or complete
-coverage of every external SDK failure.
+```sh
+python -m pytest tests
+python -m tests.smoke_test
+python -m tests.check_startup
+```
 
-Run manual checks from the repository root with `python -m tests.smoke_test`.
-Run the server startup check with `python -m tests.check_startup`.
-Functions named `smoke_*` are not automatically executed by pytest.
-The manual runner uses simulated providers by default. Its idempotency
-checks use temporary storage, test identity, isolated admission state,
-and controlled retry settings.
+The smoke runner checks provider adapters, request-tracing headers, retries,
+timeouts, deadlines, and duplicate handling. Its `smoke_*` functions are not
+run by pytest. It uses simulated providers by default; `--live` also calls
+the configured primary provider with fallback disabled.
 
-Passing `--live` additionally calls the configured primary provider
-with fallback disabled. Importing the application still initializes
-its configured request store, so set a temporary `IDEMPOTENCY_DB_PATH`
-before launching isolated checks.
+The startup check starts a real Uvicorn server with a fake provider, temporary
+storage, and test identity. It checks both health endpoints and chat, then
+stops the server.
+
+These checks cover selected behavior, not real-model quality, production
+capacity, every provider failure, or complete tenant isolation.
 
 ## Continuous integration
 
-Section reviewed against source: 2026-10-05.
+`.github/workflows/ci.yaml` runs on pushes and pull requests using Python 3.12
+on Ubuntu 24.04. The job has a ten-minute timeout and read-only repository
+permissions. Steps run in order; a failure stops the later steps.
 
-`.github/workflows/ci.yaml` runs on pushes and pull requests. Its single
-`checks` job uses Python 3.12 on Ubuntu 24.04, has a ten-minute timeout,
-and grants read-only repository-content permissions.
-
-Dependency files live at the repository root. For Windows development,
-install with `python -m pip install -r requirements-dev.txt`. The CI lock
-targets Linux Python 3.12 and includes an unconditional `uvloop` dependency,
-so installing that lock on Windows fails; moving it does not change its
-platform requirements, pinned versions, or hashes.
-
-| Step | Current behavior |
+| Step | Behavior |
 |---|---|
-| Dependency installation | Installs `requirements-ci.lock` with `--require-hashes`, then runs `pip check`. The Python 3.12 lock includes pinned, hashed `uvloop` for `uvicorn[standard]`; CI does not regenerate it. |
-| Ruff lint | Checks `model_bridge` and `tests`, and explicitly selects `.github/workflows/ruff.toml`, which enables `E9` and `F` for syntax and Pyflakes checks. |
-| Dependency audit | Installs `pip-audit` into a separate temporary virtual environment and audits the lock with `--require-hashes --strict`. The audit tool itself is currently unpinned. |
-| Isolated tests | Runs pytest with fake-provider settings, temporary SQLite storage, and a temporary test directory. Network sockets are disabled; Unix sockets are allowed. |
-| Application startup | Runs `python -m tests.check_startup`, which starts Uvicorn with `tests.testing_app:create_test_app` on loopback and verifies liveness, readiness, and fake-provider chat using temporary storage and simulated identity. It stops the child process after the check. |
+| Install dependencies | Install exact versions from `requirements-ci.lock`, verify download hashes, and run `pip check`. |
+| Ruff lint | Check `model_bridge` and `tests` for syntax errors, undefined names, unused imports, and related issues using `.github/workflows/ruff.toml`. |
+| Security audit | Run `pip-audit --require-hashes --strict` on the lock in a separate environment. The audit tool itself is unpinned. |
+| Tests | Use fake providers and temporary storage. Block network sockets; allow Unix sockets. |
+| Startup | Run `python -m tests.check_startup` against a local server. |
 
-The job disables fallback and supplies no OpenAI credential. Dependency
-installation and vulnerability auditing require network access; pytest's
-socket restriction applies only to the test step. The separate startup
-check uses local HTTP requests and does not call a live model provider.
+Fallback is disabled and no OpenAI credential is supplied. Installation and
+auditing need network access; the socket restriction applies only to pytest.
+Lint failures fail the job rather than producing advisory warnings.
 
-Steps run sequentially. A failed installation, lint, audit, or test step
-normally skips the remaining steps and fails the job. Ruff violations
-are failures rather than advisory warnings.
+Dependency files live at the repository root. Windows development uses
+`python -m pip install -r requirements-dev.txt`. The CI lock targets Linux
+Python 3.12 and contains `uvloop`, which cannot be installed on Windows.
 
-Local verification on 2026-10-05 passed Ruff, all **82 pytest tests**,
-the complete local smoke runner, and the Uvicorn startup check.
-Verification used fake providers and temporary storage. Windows pytest
-ran without CI's Linux socket-restriction flags. The startup check uses
-the test factory with simulated identity; it does not verify production
-authentication. No real-provider call or hosted GitHub Actions run was
-verified in this review.
+On 2026-10-05, local checks passed Ruff, **82 tests**, smoke checks, startup,
+and `pip check`. Windows pytest used a fresh workspace temporary directory
+after the default temporary directory caused a permissions error; it ran
+without Linux socket restrictions. Earlier migration checks in a clean Linux
+Python 3.12 container also passed locked installation, `pip check`, Ruff,
+82 socket-restricted tests, and startup.
 
-A clean Linux Python 3.12 container also installed the hashed lock, passed
-`pip check` and Ruff, ran all 82 tests with CI's socket restrictions,
-and passed the Uvicorn startup check. The dependency audit was not
-rerun during this migration. A hosted GitHub Actions pass has not been
-verified here.
-Docker build and image checks, load tests, live-provider evaluations,
-and automatic deployment are not included.
+The security audit was not rerun during the migration. No hosted GitHub
+Actions run or real-provider call was verified here. CI does not build Docker
+images, run load tests or live-model evaluations, or deploy the application.
 
-## Current boundaries
+## Remaining work and future direction
 
-- Cost estimates are incomplete, based on outdated estimates of OpenAI models. The aim is to package this application with the lightest weight open-source model as a default fallback with extendability to more powerful models through Ollama and other popular providers.
+- Connect trusted credentials to tenant identity when production authentication
+  is needed; keep simulated identity confined to test entry points.
+- Apply the remaining tenant policies and unused configuration switches.
+- Make circuit-open API responses retryable when no provider call occurred.
+- Improve database failure handling, add storage-failure metrics, and define
+  data cleanup and incompatible-schema handling.
+- Verify tenant isolation across identity, storage, and future features.
+- Review model pricing; cost estimates are incomplete and need updating.
+- Add Docker packaging and image checks.
 
-- Production credential-to-tenant authentication remains to be connected.
-- Concurrency and platform input limits are implemented; remaining tenant
-  policies and configuration switches need runtime enforcement.
-- Circuit-open API handling needs to preserve retryability after zero calls.
-- Storage failure handling and retention need further hardening.
-- Storage uses tenant/request composite keys; complete tenant isolation
-  still depends on trusted identity and consistent boundaries.
-- Automatic schema migration and incompatible-schema startup checks
-  remain unimplemented.
-- UTC log timestamps, bounded tenant metric labels, and active-generation
-  metrics are implemented. Dedicated storage-failure metrics remain
-  unfinished.
-- Docker packaging and image checks are not yet present.
+The intended future fallback is a lightweight open-source model, with support
+for stronger models through Ollama and other providers. This is a future goal;
+the current default still uses the same Ollama backend for primary and fallback.
