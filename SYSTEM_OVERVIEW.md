@@ -196,17 +196,42 @@ integration suite.
 
 ## Continuous integration
 
-`.github/workflows/ci.yaml` defines checks for pushes and pull requests.
-It uses Python 3.12 on Ubuntu, installs hash-locked dependencies from
-`scripts/requirements-ci.lock`, runs `pip check` and Ruff, and runs
-pytest with fake providers and temporary storage. The test command
-disables network sockets while allowing Unix sockets.
+Section reviewed against source: 2026-10-04.
 
-At this review, `scripts/requirements-ci.lock` is absent, so the workflow's
-dependency-install step cannot complete until that file is supplied or
-the installation configuration is changed. The workflow's presence is
-not evidence that a hosted CI run has passed. It does not currently build
-a Docker image.
+`.github/workflows/ci.yaml` runs on pushes and pull requests. Its single
+`checks` job uses Python 3.12 on Ubuntu 24.04, has a ten-minute timeout,
+and grants read-only repository-content permissions.
+
+| Step | Current behavior |
+|---|---|
+| Dependency installation | Installs `scripts/requirements-ci.lock` with `--require-hashes`, then runs `pip check`. The lock file exists and identifies Python 3.12 as its generation environment; CI does not regenerate it. |
+| Ruff lint | Explicitly selects `.github/workflows/ruff.toml`, which enables `E9` and `F` for syntax and Pyflakes checks. |
+| Dependency audit | Installs `pip-audit` into a separate temporary virtual environment and audits the lock with `--require-hashes --strict`. The audit tool itself is currently unpinned. |
+| Isolated tests | Runs pytest with fake-provider settings, temporary SQLite storage, and a temporary test directory. Network sockets are disabled; Unix sockets are allowed. |
+| Application startup | Runs `scripts/check_startup.py`, which starts an actual Uvicorn process on loopback and verifies liveness, readiness, and fake-provider chat using temporary storage. It stops the child process after the check. |
+
+The job disables fallback and supplies no OpenAI credential. Dependency
+installation and vulnerability auditing require network access; pytest's
+socket restriction applies only to the test step. The separate startup
+check uses local HTTP requests and does not call a live model provider.
+
+Steps run sequentially. A failed installation, lint, audit, or test step
+normally skips the remaining steps and fails the job. Ruff violations
+are failures rather than advisory warnings.
+
+The latest local pytest baseline is **43 passed and 30 failed**: all 40
+pre-existing tests pass, alongside three new boundary cases. The 15
+original limit-test failures and 15 tenant-admission failures are expected
+pending concurrency, input-limit, and authenticated-identity implementation
+in `test_concurrency_limits.py`, `test_input_limits.py`, and
+`test_tenant_concurrency.py`. These tests
+are collected by CI and currently prevent the full suite from passing.
+
+A hosted GitHub Actions pass has not been verified here. Local Windows
+checks do not establish that the lock installs successfully on Ubuntu,
+that the audit passes, or that the network-restricted test command passes.
+Docker build and image checks, load tests, live-provider evaluations,
+and automatic deployment are not included.
 
 ## Current boundaries
 

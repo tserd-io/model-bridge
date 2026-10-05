@@ -81,6 +81,7 @@ class PlatformSettings(SettingsModel):
     # This limit applies to one process, not all workers or replicas.
     max_concurrent_jobs_per_instance: int = Field(default=5, ge=1)
     max_input_bytes: int = Field(default=1048576, ge=1)
+    max_message_characters: int = Field(default=32768, ge=1)
     max_output_tokens: int = Field(default=8192, ge=1)
     request_deadline_seconds: float = Field(default=45, gt=0)
     shutdown_grace_seconds: float = Field(default=50, gt=0)

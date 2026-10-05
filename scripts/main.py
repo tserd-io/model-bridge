@@ -1,7 +1,7 @@
 import asyncio
 import time
 import sqlite3
-from fastapi import FastAPI
+from fastapi import Depends
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
@@ -12,7 +12,20 @@ from scripts.request_store import IdempotencyConflictError, RequestStore
 from scripts.rate_limit import SlidingWindowRateLimiter
 from scripts.providers import create_provider
 from scripts.circuit_breaker import CircuitBreaker
+from typing import Annotated
+from starlette.middleware.body_limit import RequestBodyLimitMiddleware
+from scripts.load_settings import PLATFORM_SETTINGS
+from fastapi import  FastAPI
 
+from scripts.concurrency_limit import (
+    ConcurrencyLimitExceeded,
+    GenerationConcurrencyLimiter,
+)
+from scripts.load_settings import SETTINGS
+from scripts.tenant_identity import (
+    AuthenticatedTenant,
+    get_authenticated_tenant,
+)
 from scripts.load_settings import (
     CIRCUIT_BREAKER_FAILURE_THRESHOLD,
     CIRCUIT_BREAKER_COOLDOWN_SECONDS,
@@ -37,6 +50,9 @@ from scripts.chat_service import (
     _state_result,
 )
 
+generation_limiter = GenerationConcurrencyLimiter(
+    SETTINGS.platform.max_concurrent_jobs_per_instance,
+)
 
 primary_provider = create_provider(LLM_PROVIDER)
 
@@ -64,6 +80,10 @@ chat_rate_limiter = SlidingWindowRateLimiter(
 )
 
 app = FastAPI()
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_body_size=PLATFORM_SETTINGS.max_input_bytes,
+)
 app.mount("/metrics", make_asgi_app())
 request_store = RequestStore(IDEMPOTENCY_DB_PATH)
 UNKNOWN_OUTCOME_DETAIL = (
@@ -95,8 +115,21 @@ async def readiness() -> JSONResponse:
 
 # Routes and rate-limits requests, handles deduplication, generates an answer, and saves its outcome.
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
+async def chat(
+        request: ChatRequest,
+        authenticated_tenant:Annotated[
+            AuthenticatedTenant, Depends(get_authenticated_tenant),
+        ],
+    ) -> ChatResponse | JSONResponse:
     started_at = time.perf_counter()
+    # Use trusted identity for storage, metrics, and generation admission.
+    request = request.model_copy(
+        update={"tenant_id": authenticated_tenant.id},
+    )
+    tenant_limits = SETTINGS.effective_tenant_limits(
+        authenticated_tenant.id,
+    )
+
     model_preference = _route_model_preference(
         request.task_type,
         request.model_preference,
@@ -196,24 +229,50 @@ async def chat(request: ChatRequest) -> ChatResponse | JSONResponse:
         )
 
     try:
-        result = await llm_call(
-            request_id=request.request_id,
-            message=request.message,
-            model_preference=model_preference,
-            max_tokens=request.max_tokens,
-            provider=primary_provider,
-            provider_name=LLM_PROVIDER,
-            fallback_provider=backup_provider,
-            fallback_provider_name=FALLBACK_PROVIDER,
-            circuit_breaker=primary_breaker,
-            fallback_circuit_breaker=backup_breaker,
-            route=route,
-            tenant_id=request.tenant_id,
-            timeout_seconds=DEFAULT_LLM_TIMEOUT_SECONDS,
-            request_deadline_seconds=REQUEST_DEADLINE_SECONDS,
-            max_attempts=MAX_LLM_ATTEMPTS,
-            retry_base_delay_seconds=RETRY_BASE_DELAY_SECONDS,
+        with generation_limiter.slot(
+            tenant_id=authenticated_tenant.id,
+            tenant_limit=tenant_limits.max_concurrent_jobs,
+        ):
+            result = await llm_call(
+                request_id=request.request_id,
+                message=request.message,
+                model_preference=model_preference,
+                max_tokens=request.max_tokens,
+                provider=primary_provider,
+                provider_name=LLM_PROVIDER,
+                fallback_provider=backup_provider,
+                fallback_provider_name=FALLBACK_PROVIDER,
+                circuit_breaker=primary_breaker,
+                fallback_circuit_breaker=backup_breaker,
+                route=route,
+                tenant_id=request.tenant_id,
+                timeout_seconds=DEFAULT_LLM_TIMEOUT_SECONDS,
+                request_deadline_seconds=REQUEST_DEADLINE_SECONDS,
+                max_attempts=MAX_LLM_ATTEMPTS,
+                retry_base_delay_seconds=RETRY_BASE_DELAY_SECONDS,
+            )
+    except ConcurrencyLimitExceeded:
+        detail = "Generation capacity is full; retry this request later"
+
+        # Preserve request identity without recording a terminal failure.
+        await asyncio.to_thread(
+            request_store.mark_retryable,
+            request.request_id,
+            detail,
         )
+
+        response = _state_result(
+            request=request,
+            route=route,
+            status="failed",
+            detail=detail,
+            status_code=503,
+            started_at=started_at,
+            attempts=0,
+            error_type="concurrency_limited",
+        )
+        response.headers["Retry-After"] = "1"
+        return response
     except ProviderOutcomeUnknown as exc:
         # Persist an uncertain outcome and return HTTP 202 without automatically resubmitting it.
         await asyncio.to_thread(

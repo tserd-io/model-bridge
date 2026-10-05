@@ -1,5 +1,7 @@
 from typing import Literal
 from pydantic import BaseModel, Field
+from scripts.load_settings import PLATFORM_SETTINGS
+
 
 # Validates incoming chat requests, including routing options and token limits.
 class ChatRequest(BaseModel):
@@ -10,7 +12,10 @@ class ChatRequest(BaseModel):
         max_length=64,
         pattern=r"^[A-Za-z0-9_.:-]+$",
     )
-    message: str = Field(min_length=1)
+    message: str = Field(
+        min_length=1,
+        max_length=PLATFORM_SETTINGS.max_message_characters,
+    )
     model_preference: Literal["fast", "balanced"]
     max_tokens: int = Field(ge=1, le=8192)
     task_type: Literal["simple", "complex", "high_risk"] | None = None

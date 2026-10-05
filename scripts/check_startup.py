@@ -50,9 +50,18 @@ def main() -> None:
         with log_path.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(
                 [
-                    sys.executable, "-m", "uvicorn", "scripts.main:app",
-                    "--host", "127.0.0.1", "--port", str(port),
-                    "--workers", "1", "--no-access-log",
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "scripts.tests.testing_app:create_test_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--workers",
+                    "1",
+                    "--no-access-log",
                 ],
                 cwd=project_root,
                 env=environment,
@@ -92,6 +101,7 @@ def main() -> None:
                     "model": "fake-fast",
                     "content": "Fake response: startup probe",
                     "attempts": 1,
+                    "tenant_id": "test-tenant",
                 }
                 if any(result.get(key) != value for key, value in expected.items()):
                     raise AssertionError(f"Unexpected chat response: {result}")
