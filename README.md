@@ -9,13 +9,19 @@ Model Bridge is a minimal Python API that gives applications a single endpoint f
 3. The provider generates a response. The gateway applies timeouts and bounded retries, with optional fallback to another configured provider.
 4. The API returns a consistent response containing the outcome, generated content, provider, model, latency, attempt count, and available usage information.
 
-Supported providers are **Ollama** for local models and **OpenAI** for hosted models. Provider selection, model mappings, timeouts, and pricing are configured in [`scripts/config.json`](scripts/config.json), with environment-variable overrides.
+Supported providers are **Ollama** for local models and **OpenAI** for hosted models. Provider selection, model mappings, timeouts, and pricing are configured in [`model_bridge/config/config.json`](model_bridge/config/config.json), with environment-variable overrides.
 
 ## Request records and observability
 
-SQLite stores request payloads, processing states, and successful responses. Repeating a completed request with the same ID and payload returns the saved response; reusing an ID with different input is rejected. Uncertain provider outcomes are recorded as `unknown`.
+SQLite stores request payloads, processing states, and successful responses. Within one tenant, repeating a completed request with the same ID and payload returns the saved response; reusing an ID with different input is rejected. Uncertain provider outcomes are recorded as `unknown`.
 
 Structured JSON logs track request IDs, provider attempts, latency, and outcomes. Prompt and response content is stored in SQLite rather than included in those operational logs. Prometheus metrics are available at `/metrics/`, including request counts, errors, retries, token usage, and estimated OpenAI costs where pricing is configured.
+
+Start the API from the repository root:
+
+```sh
+python -m uvicorn model_bridge.main:app
+```
 
 Health endpoints report application liveness at `/health/live` and database read availability at `/health/ready`.
 
@@ -26,7 +32,7 @@ The evaluation runner sends a versioned set of prompts through the gateway and c
 Run from the project root with the dependencies installed and your provider configured:
 
 ```sh
-python -m scripts.evaluations.eval_runner
+python -m model_bridge.evaluations.eval_runner
 ```
 
-Prompts are defined in [`scripts/evaluations/golden_dataset.json`](scripts/evaluations/golden_dataset.json). Results are written to `scripts/evaluations/runs/`.
+Prompts are defined in [`model_bridge/evaluations/datasets/golden_dataset.json`](model_bridge/evaluations/datasets/golden_dataset.json). Results are written to `data/evaluation_runs/`.

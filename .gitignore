@@ -1,4 +1,8 @@
 gateway_requests.sqlite3
 gateway_requests.sqlite3-shm
 gateway_requests.sqlite3-wal
-scripts/evaluations/runs/
+data/
+.venv/
+.venv312/
+__pycache__/
+.pytest_cache/
