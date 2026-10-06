@@ -7,7 +7,10 @@ from dataclasses import asdict, dataclass, replace
 from typing import Literal
 from model_bridge.application.outcomes import ChatCommand, ChatOutcome, ChatResult
 from model_bridge.config.models import Settings
-from model_bridge.execution.generation import llm_call
+from model_bridge.execution.generation import (
+    CircuitUnavailableError,
+    llm_call,
+)
 from model_bridge.execution.circuit_breaker import CircuitBreaker
 from model_bridge.execution.concurrency_limit import (
     ConcurrencyLimitExceeded,
@@ -279,6 +282,36 @@ class ChatService:
                 timed_out=True,
             )
         except RetryableProviderError as exc:
+            # A circuit rejection before any provider call is safe to retry.
+            if (
+                isinstance(exc, CircuitUnavailableError)
+                and exc.attempts == 0
+                and not exc.outcome_unknown
+            ):
+                detail = "Provider circuit is temporarily unavailable; retry later"
+
+                await asyncio.to_thread(
+                    self.request_store.mark_retryable,
+                    request.tenant_id,
+                    request.request_id,
+                    detail,
+                )
+
+                outcome = self._state_result(
+                    request=request,
+                    route=route,
+                    status="failed",
+                    detail=detail,
+                    status_code=503,
+                    started_at=started_at,
+                    attempts=0,
+                    error_type="circuit_open",
+                )
+
+                return replace(
+                    outcome,
+                    retry_after=max(1, exc.retry_after),
+                )
             # Use accumulated uncertainty to choose unknown/202 or failed/503 and preserve the attempt count.
             status = "unknown" if exc.outcome_unknown else "failed"
 

@@ -1,10 +1,42 @@
 # Model Bridge: Architecture and Behavior
 
-Last reviewed against source: 2026-10-05.
+Last reviewed against source: 2026-10-06.
+Scope and Docker/CI documentation updated: 2026-10-06.
 
 Model Bridge provides one API for calling LLM providers. It chooses models,
 limits work, saves request results, and measures response quality. This
 overview describes its current behavior and remaining work.
+
+## Project scope and review guidance
+
+Model Bridge demonstrates LLM routing, provider abstraction, bounded execution,
+request tracking, evaluation, and portable application packaging. It is not
+currently pursuing a full production database service or a complete
+authentication product.
+
+SQLite is a temporary reference implementation used to demonstrate and test
+request states, duplicate handling, saved responses, and tenant-scoped keys.
+Demonstration data is disposable; durability across container replacement is
+not a project requirement. Keep existing functional storage tests, but do not
+expand the roadmap into SQLite-specific resilience, persistent-volume testing,
+migrations, backup/restore, retention operations, or exhaustive database failure
+testing. A durable storage implementation is an optional extension and is not
+being advanced within the current scope.
+
+Authentication is also an optional extension that is not currently being
+pursued. Tenant identity remains useful for demonstrating policy, capacity,
+and request separation. The identity dependency is an integration point for a
+future authenticator, while controlled tests supply simulated identities.
+Building credential verification, login, key management, or an identity
+provider is not a current deliverable.
+
+Future reviews should respect these decisions: do not repeatedly list absent
+production authentication or advanced database capabilities as defects,
+deployment blockers, or recommended next improvements unless the project owner
+explicitly expands the scope. Continue to identify regressions in the promised
+functional behavior, such as incorrect replay, cross-tenant result mixing,
+broken routing, or ineffective execution limits. Document actual limitations
+accurately without converting optional extensions into an active backlog.
 
 ## Source map
 
@@ -63,7 +95,7 @@ model-bridge/
 │  ├─ smoke_test.py               # Manual local checks; --live opts into a provider call
 │  ├─ test_chat_responses.py      # Response codes, data and headers
 │  ├─ test_chat_service.py        # Service calls and saved results per tenant
-│  ├─ test_circuit_breaker.py      # Breaker opening, cooldown and recovery
+│  ├─ test_circuit_breaker.py      # Breaker states, API retryability and provider settings
 │  ├─ test_concurrency_limits.py   # Capacity limits and retries after rejection
 │  ├─ test_evaluation.py          # Evaluation summaries and files
 │  ├─ test_gateway.py             # Routing, retries and stored results
@@ -80,6 +112,7 @@ model-bridge/
 │     ├─ ci.yaml                  # Installation, lint, security and test checks
 │     └─ ruff.toml                # CI lint rules
 ├─ .gitignore
+├─ Dockerfile                    # Non-root image and readiness health check
 ├─ pytest.ini
 ├─ README.md
 └─ SYSTEM_OVERVIEW.md
@@ -138,6 +171,7 @@ separate. Chat requires an `AuthenticatedTenant` in
 open-ended: the production app does not establish this identity, so valid
 chat requests currently receive HTTP 401 unless trusted identity is supplied.
 A tenant ID in the request body cannot establish identity.
+This is an intentional extension boundary, not an active authentication task.
 
 Tests supply identities through dependency overrides.
 `tests.testing_app:create_test_app` supplies a test identity and requires a
@@ -186,11 +220,13 @@ SQLite transactions coordinate request claims. Each running request has a
 time limit for recording its result, called a processing lease. If that
 lease expires, the request becomes `unknown` when checked again.
 
-Startup creates missing databases and tables. The prototype database was
-reset and the tenant/request primary key verified. Existing incompatible
-tables are neither migrated nor rejected at startup. Data cleanup and
-consistent handling of database failures remain unfinished, including
-failures while saving an already-generated response.
+Startup creates missing databases and tables. Existing incompatible tables
+are neither migrated nor rejected at startup. The reference implementation
+assumes a fresh compatible database for demonstrations; it does not promise
+production recovery, retention, or successful persistence after disk failures.
+Failures while saving an already-generated response remain a limitation of
+this placeholder. Advancing these database-specific capabilities is outside
+the current scope, rather than required follow-up work.
 
 ## Retries, fallback, and the circuit breaker
 
@@ -215,9 +251,15 @@ starts another cooldown. Old call results cannot overwrite newer breaker
 state. Primary and fallback share a breaker when they use the same configured
 backend; rejected calls do not count as provider attempts.
 
-One API integration issue remains: `CircuitUnavailableError` uses the generic
-retryable-error handler. A rejection before any provider call is saved as a
-final failure, and its retry delay is not passed to the client.
+Each configured provider supplies its own circuit-breaker failure threshold
+and cooldown. Primary and fallback share one breaker when they use the same
+configured provider name.
+
+A circuit rejection before any provider call returns HTTP 503 with
+`Retry-After` and saves the request as `retryable`. Repeating the same ID and
+input can reclaim that record after cooldown. Different input still returns
+HTTP 409. Requests with uncertain earlier attempts remain `unknown` and are
+not automatically generated again.
 
 ## Logs, metrics, and health
 
@@ -231,7 +273,8 @@ latency, saved-response reuse, available token usage, and estimated cost.
 `llm_active_generations` counts jobs holding generation capacity in the
 current process, including retry delays. It decreases when work completes,
 fails, or is cancelled. Disabling metrics stops recording and removes the
-endpoint. Storage-failure metrics are not implemented.
+endpoint. Storage-failure metrics are not implemented and are not part of the
+current database demonstration scope.
 
 Tenant labels are disabled by default, so all tenants use `all`. When
 enabled, up to 100 configured tenants get individual labels; everyone else
@@ -249,6 +292,8 @@ they are not a complete record of all remote work or charges.
 Readiness opens SQLite read-only and does not create a missing database.
 It does not check the full table structure, database writes, or provider
 availability. An incompatible table can pass readiness while chat fails.
+This is a basic demonstration health check, not a database durability or
+schema-compatibility guarantee; expanding it into those checks is not planned.
 
 ## Evaluations
 
@@ -276,6 +321,9 @@ The CLI creates a local API client and writes results to
 `data/evaluation_runs/`. It currently supplies no trusted tenant identity,
 so chat calls receive 401. Evaluation tests supply a test identity;
 programmatic callers supply and manage their own client.
+Preserve this limitation in usage guidance. Making controlled evaluations
+usable need not introduce production authentication; that extension remains
+outside scope.
 
 ## Tests and manual checks
 
@@ -312,8 +360,9 @@ capacity, every provider failure, or complete tenant isolation.
 ## Continuous integration
 
 `.github/workflows/ci.yaml` runs on pushes and pull requests using Python 3.12
-on Ubuntu 24.04. The job has a ten-minute timeout and read-only repository
-permissions. Steps run in order; a failure stops the later steps.
+on Ubuntu 24.04. Both jobs have a ten-minute timeout and read-only repository
+permissions. Steps run in order within each job; the application checks and
+Docker smoke job can run independently.
 
 | Step | Behavior |
 |---|---|
@@ -323,6 +372,12 @@ permissions. Steps run in order; a failure stops the later steps.
 | Tests | Use fake providers and temporary storage. Block network sockets; allow Unix sockets. |
 | Startup | Run `python -m tests.check_startup` against a local server. |
 
+The separate `docker-smoke` job builds the image, starts it with a fake
+provider and no fallback, and waits for its Docker readiness health check.
+It reports logs and container state on failure and removes the container on
+completion. The Dockerfile uses a non-root user, writable `/data`, and one
+Uvicorn worker. It currently installs the CI lock, including development tools.
+
 Fallback is disabled and no OpenAI credential is supplied. Installation and
 auditing need network access; the socket restriction applies only to pytest.
 Lint failures fail the job rather than producing advisory warnings.
@@ -330,6 +385,12 @@ Lint failures fail the job rather than producing advisory warnings.
 Dependency files live at the repository root. Windows development uses
 `python -m pip install -r requirements-dev.txt`. The CI lock targets Linux
 Python 3.12 and contains `uvloop`, which cannot be installed on Windows.
+
+On 2026-10-06, local checks passed Ruff and **86 tests**, including four new
+circuit cases covering retryable storage, recovery with the same request ID,
+preserved uncertainty, and provider-specific breaker settings. These checks
+used fake providers and temporary storage; no application code changed in
+this follow-up.
 
 On 2026-10-05, local checks passed Ruff, **82 tests**, smoke checks, startup,
 and `pip check`. Windows pytest used a fresh workspace temporary directory
@@ -339,20 +400,41 @@ Python 3.12 container also passed locked installation, `pip check`, Ruff,
 82 socket-restricted tests, and startup.
 
 The security audit was not rerun during the migration. No hosted GitHub
-Actions run or real-provider call was verified here. CI does not build Docker
-images, run load tests or live-model evaluations, or deploy the application.
+Actions run or real-provider call was verified here. Docker build and health
+checks are now configured; this documentation update does not establish that
+their hosted run passed. CI does not scan the built image, run load tests or
+live-model evaluations, or deploy the application.
+
+## Docker priorities within the current scope
+
+| Area | Priority and scope |
+|---|---|
+| Image build, non-root startup, basic health | Keep the existing functional baseline. |
+| `.dockerignore` | Small, useful next addition to exclude local environments, data, credentials, and Git history from the build context. |
+| HTTP through a published port | Useful next check that the packaged API is reachable through container networking. No production authentication is required to check health endpoints. |
+| Image vulnerability scan | Useful packaging check covering OS and application dependencies; add as CI maturity work. |
+| Basic shutdown | Optional bounded stop check; durable request draining and database recovery testing are outside scope. |
+| Runtime-only dependency lock | Optional image-size and dependency cleanup, not a functional blocker. |
+| Persistent volumes and database survival after replacement | Outside scope for disposable SQLite demonstration data. Do not add as a required check. |
+| Production authentication inside the container | Optional extension, not an image acceptance requirement. |
+
+Keep Docker checks focused on packaging and basic operation. Extensive storage
+testing and full credential flows would change the project's scope rather
+than complete the current Docker work.
 
 ## Remaining work and future direction
 
-- Connect trusted credentials to tenant identity when production authentication
-  is needed; keep simulated identity confined to test entry points.
 - Apply the remaining tenant policies and unused configuration switches.
-- Make circuit-open API responses retryable when no provider call occurred.
-- Improve database failure handling, add storage-failure metrics, and define
-  data cleanup and incompatible-schema handling.
-- Verify tenant isolation across identity, storage, and future features.
+- Preserve demonstrated tenant separation and duplicate handling when changing
+  existing features; this does not require a production identity system.
 - Review model pricing; cost estimates are incomplete and need updating.
-- Add Docker packaging and image checks.
+- Improve packaging checks according to the scoped Docker priorities above.
+
+Durable storage and production authentication remain documented extension
+points, not work being pursued. A future storage adapter could replace the
+SQLite request store; a future authenticator could supply trusted tenant
+identity through the existing dependency. Neither extension is required to
+complete the current functional demonstration.
 
 The intended future fallback is a lightweight open-source model, with support
 for stronger models through Ollama and other providers. This is a future goal;

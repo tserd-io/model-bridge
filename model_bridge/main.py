@@ -20,10 +20,16 @@ def create_chat_service(settings: Settings = SETTINGS) -> ChatService:
     primary = settings.primary_provider
     fallback = settings.fallback_provider
     provider_settings = settings.providers[primary]
+    # Share a breaker for each configured provider name.
+    # Each breaker uses that provider's own threshold and cooldown.
     breakers = {
         name: CircuitBreaker(
-            failure_threshold=provider_settings.circuit_breaker_failure_threshold,
-            cooldown_seconds=provider_settings.circuit_breaker_cooldown_seconds,
+            failure_threshold=(
+                settings.providers[name].circuit_breaker_failure_threshold
+            ),
+            cooldown_seconds=(
+                settings.providers[name].circuit_breaker_cooldown_seconds
+            ),
         )
         for name in {primary, fallback}
         if name is not None
