@@ -14,6 +14,7 @@ from model_bridge.providers.contracts import GenerationResult
 def isolated_chat_service(monkeypatch, tmp_path):
     data = SETTINGS.model_dump()
     data["providers"]["fake"] = {"type": "fake"}
+    data["tenant_defaults"]["rate_limit"] = {"requests": 100, "window_seconds": 60}
     data["primary_provider"] = "fake"
     data["fallback_provider"] = None
     data["storage"]["path"] = tmp_path / "requests.sqlite3"

@@ -16,6 +16,17 @@ The current application still lacks proposed runtime behavior, including
 `TenantRateLimiter`, which prevents full-suite collection. Runtime changes below
 remain proposals; no production code was changed as part of this test-only work.
 
+Verification of this test-only change:
+
+- Ruff checks on `tests`: passed.
+- Generation and runtime-settings modules: 16 passed, 17 failed, 2 skipped.
+  Failures expose pending timeout, deadline, logging, startup, and settings behavior.
+  The skips are the existing Linux-only signal tests on Windows.
+- Full-suite collection: blocked in seven modules by the missing
+  `TenantRateLimiter` implementation. These tests must pass after the runtime
+  changes are applied; no expected-failure markers or fallback implementations
+  were added to hide the missing behavior.
+
 Review proposal for the remaining runtime changes only.
 
 The following snippets show the proposed code with surrounding context. Above each code block, current line ranges identify its location in the unchanged source and proposed ranges identify its location in the complete revised file. Apply the snippets together, accounting for line shifts; they are excerpts rather than separate standalone files. The new request_policy.py module is shown in full.

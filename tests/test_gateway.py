@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import model_bridge.execution.rate_limit as rate_limit_module
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import SlidingWindowRateLimiter, TenantRateLimiter
 import model_bridge.main as main_module
 from model_bridge.config.loader import MAX_LLM_ATTEMPTS
 from model_bridge.evaluations.eval_runner import run_evaluation
@@ -64,7 +64,7 @@ def isolated_rate_limiter(monkeypatch):
     monkeypatch.setattr(
         main_module.app.state.chat_service,
         "chat_rate_limiter",
-        SlidingWindowRateLimiter(limit=100, window_seconds=60),
+        TenantRateLimiter(platform_limit=100, platform_window_seconds=60),
     )
 
 
@@ -547,8 +547,8 @@ def test_rate_limit_returns_retry_after(
     isolated_request_store,
     limiter_clock,
 ):
-    limiter = SlidingWindowRateLimiter(limit=1, window_seconds=10)
-    assert limiter.try_acquire() is None
+    limiter = TenantRateLimiter(platform_limit=1, platform_window_seconds=10)
+    assert limiter.try_acquire("test-tenant", limit=100, window_seconds=60) is None
 
     limiter_clock[0] = 100.2
 

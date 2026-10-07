@@ -349,3 +349,195 @@ def test_deadline_is_not_reset_for_fallback(breaker_clock, monkeypatch):
     assert error.value.attempts == 1
     assert error.value.outcome_unknown is True
     fallback.complete.assert_not_awaited()
+
+
+# Enforces timeout at the gateway boundary even when the provider ignores its timeout argument.
+def test_gateway_times_out_uncooperative_adapter():
+    async def scenario():
+        cancelled = asyncio.Event()
+
+        async def blocked(**kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        provider = SimpleNamespace(complete=blocked)
+        with pytest.raises(RetryableProviderError) as error:
+            await asyncio.wait_for(
+                generation.llm_call(
+                    "bounded-call",
+                    "hello",
+                    "fast",
+                    1,
+                    provider=provider,
+                    provider_name="fake",
+                    timeout_seconds=0.01,
+                    request_deadline_seconds=1,
+                    max_attempts=1,
+                ),
+                timeout=1,
+            )
+        assert error.value.failure_type == "timeout"
+        assert error.value.outcome_unknown is True
+        assert error.value.attempts == 1
+        assert cancelled.is_set()
+
+    asyncio.run(scenario())
+
+
+# Expired local admission spends no provider attempt and always releases a half-open probe.
+@pytest.mark.parametrize("phase", ["breaker", "logging"])
+def test_deadline_expiry_before_provider_call(monkeypatch, phase):
+    clock = [0.0]
+    breaker = CircuitBreaker(
+        failure_threshold=1, cooldown_seconds=1, clock=lambda: clock[0]
+    )
+    permit = breaker.acquire()
+    breaker.finish(permit, "failure")
+    clock[0] = 1.0
+    acquire = breaker.acquire
+
+    def delayed_acquire():
+        result = acquire()
+        if phase == "breaker":
+            clock[0] += 6
+        return result
+
+    def delayed_log(event, **fields):
+        if phase == "logging" and event == "provider_attempt_started":
+            clock[0] += 6
+
+    monkeypatch.setattr(breaker, "acquire", delayed_acquire)
+    monkeypatch.setattr(generation, "log_event", delayed_log)
+    monkeypatch.setattr(
+        generation,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]),
+            TimeoutError=asyncio.TimeoutError,
+            sleep=asyncio.sleep,
+        ),
+    )
+    metrics = Mock()
+    monkeypatch.setattr(generation, "record_provider_attempt", metrics)
+    provider = SimpleNamespace(
+        complete=AsyncMock(return_value=GenerationResult("ok", "fake-fast"))
+    )
+    with pytest.raises(RetryableProviderError) as error:
+        asyncio.run(
+            generation.llm_call(
+                "admission-expiry",
+                "hello",
+                "fast",
+                1,
+                provider=provider,
+                provider_name="fake",
+                circuit_breaker=breaker,
+                request_deadline_seconds=5,
+                max_attempts=1,
+            )
+        )
+    assert error.value.failure_type == "deadline_exceeded"
+    assert error.value.attempts == 0
+    assert error.value.outcome_unknown is False
+    provider.complete.assert_not_awaited()
+    metrics.assert_not_called()
+    assert breaker.state == "open"
+    clock[0] += 1
+    next_probe = acquire()
+    breaker.finish(next_probe, "success")
+    assert breaker.state == "closed"
+
+
+# Uses the remaining deadline after synchronous logging, not the earlier attempt allowance.
+def test_logging_time_reduces_provider_timeout(monkeypatch):
+    clock = [0.0]
+
+    def delayed_log(event, **fields):
+        if event == "provider_attempt_started":
+            clock[0] += 2
+
+    monkeypatch.setattr(generation, "log_event", delayed_log)
+    monkeypatch.setattr(
+        generation,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]),
+            TimeoutError=asyncio.TimeoutError,
+            sleep=asyncio.sleep,
+        ),
+    )
+    provider = SimpleNamespace(
+        complete=AsyncMock(return_value=GenerationResult("ok", "fake-fast"))
+    )
+    result = asyncio.run(
+        generation.llm_call(
+            "reduced-budget",
+            "hello",
+            "fast",
+            1,
+            provider=provider,
+            provider_name="fake",
+            request_deadline_seconds=5,
+            timeout_seconds=10,
+            max_attempts=1,
+        )
+    )
+    assert result.attempts == 1
+    assert provider.complete.await_args.kwargs["timeout"] == 3
+
+
+# Local fallback admission expiry retains the earlier actual attempt and its uncertain outcome.
+def test_fallback_admission_expiry_preserves_prior_uncertainty(monkeypatch):
+    clock = [0.0]
+    primary = SimpleNamespace(
+        complete=AsyncMock(
+            side_effect=RetryableProviderError(
+                "timeout",
+                outcome_unknown=True,
+                failure_type="timeout",
+            )
+        )
+    )
+    backup = SimpleNamespace(
+        complete=AsyncMock(return_value=GenerationResult("ok", "fake-fast"))
+    )
+
+    def delayed_log(event, **fields):
+        if event == "provider_attempt_started" and fields.get("provider") == "backup":
+            clock[0] += 6
+
+    monkeypatch.setattr(generation, "log_event", delayed_log)
+    monkeypatch.setattr(
+        generation,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock[0]),
+            TimeoutError=asyncio.TimeoutError,
+            sleep=asyncio.sleep,
+        ),
+    )
+    metrics = Mock()
+    monkeypatch.setattr(generation, "record_provider_attempt", metrics)
+    with pytest.raises(RetryableProviderError) as error:
+        asyncio.run(
+            generation.llm_call(
+                "fallback-admission",
+                "hello",
+                "fast",
+                1,
+                provider=primary,
+                provider_name="primary",
+                fallback_provider=backup,
+                fallback_provider_name="backup",
+                request_deadline_seconds=5,
+                max_attempts=3,
+            )
+        )
+    assert error.value.failure_type == "deadline_exceeded"
+    assert error.value.attempts == 1
+    assert error.value.outcome_unknown is True
+    assert primary.complete.await_count == 1
+    backup.complete.assert_not_awaited()
+    assert metrics.call_count == 1

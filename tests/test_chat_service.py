@@ -10,13 +10,13 @@ from model_bridge.execution import generation
 from model_bridge.providers.contracts import GenerationResult
 import model_bridge.storage.request_store as storage_module
 from model_bridge.application.outcomes import ChatCommand, ChatOutcome
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import TenantRateLimiter
 
 
 # Verifies direct service execution isolates tenants sharing an ID and replays saved results.
 def test_service_handles_tenant_scoped_commands_without_http(isolated_chat_service):
     service = isolated_chat_service
-    service.chat_rate_limiter = SlidingWindowRateLimiter(100, 60)
+    service.chat_rate_limiter = TenantRateLimiter(100, 60)
     command_a = ChatCommand("shared-id", "tenant-a", "first", "fast", 10)
     command_b = ChatCommand("shared-id", "tenant-b", "second", "fast", 10)
 

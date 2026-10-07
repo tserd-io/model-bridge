@@ -27,7 +27,7 @@ from model_bridge.providers.openai import OpenAIProvider
 from model_bridge.providers.ollama import OllamaProvider
 from model_bridge.providers.transport import is_retryable_status_code
 from model_bridge.providers.transport import run_with_attempt_timeout
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import TenantRateLimiter
 from model_bridge.storage.request_store import RequestStore
 from model_bridge.api.schemas import ChatRequest
 from model_bridge.api.dependencies import AuthenticatedTenant, get_authenticated_tenant
@@ -138,7 +138,14 @@ def smoke_client(provider, *, provider_name="fake", deterministic=True):
     source = main_module.app.state.chat_service
     provider_settings = source.settings.providers[source.settings.primary_provider]
     with TemporaryDirectory() as directory:
+        smoke_settings_data = source.settings.model_dump()
+        smoke_settings_data["tenant_defaults"]["rate_limit"] = {
+            "requests": 100,
+            "window_seconds": 10,
+        }
+        smoke_settings_data["tenant_overrides"] = {}
         replacements = {
+            "settings": type(source.settings).model_validate(smoke_settings_data),
             "request_store": RequestStore(Path(directory) / "requests.sqlite3"),
             "primary_provider": provider,
             "backup_provider": None,
@@ -149,7 +156,7 @@ def smoke_client(provider, *, provider_name="fake", deterministic=True):
                 cooldown_seconds=provider_settings.circuit_breaker_cooldown_seconds,
             ),
             "backup_breaker": None,
-            "chat_rate_limiter": SlidingWindowRateLimiter(100, 10),
+            "chat_rate_limiter": TenantRateLimiter(100, 10),
             "generation_limiter": GenerationConcurrencyLimiter(1),
         }
         if deterministic:

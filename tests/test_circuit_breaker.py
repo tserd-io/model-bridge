@@ -13,7 +13,7 @@ from model_bridge.config.models import Settings
 from model_bridge.execution.circuit_breaker import CircuitBreaker
 from model_bridge.execution.circuit_breaker import CircuitOpenError
 from model_bridge.execution.generation import CircuitUnavailableError
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import TenantRateLimiter
 from model_bridge.providers.contracts import GenerationResult
 
 
@@ -136,7 +136,7 @@ def test_api_circuit_rejection_preserves_retryable_storage(
     breaker_clock,
 ):
     service = isolated_chat_service
-    service.chat_rate_limiter = SlidingWindowRateLimiter(100, 60)
+    service.chat_rate_limiter = TenantRateLimiter(100, 60)
     breaker, now = breaker_clock
 
     breaker.finish(breaker.acquire(), "failure")
@@ -223,7 +223,7 @@ def test_api_circuit_rejection_preserves_retryable_storage(
 # and repeating the request does not cause another generation attempt.
 def test_api_circuit_error_preserves_previous_uncertainty(isolated_chat_service):
     service = isolated_chat_service
-    service.chat_rate_limiter = SlidingWindowRateLimiter(100, 60)
+    service.chat_rate_limiter = TenantRateLimiter(100, 60)
     service.generate = AsyncMock(
         side_effect=CircuitUnavailableError(
             attempts=1,
