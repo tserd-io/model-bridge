@@ -17,6 +17,8 @@ from model_bridge.application.outcomes import ChatOutcome, ChatResult
         ("rate_limited", "failed", 429),
         ("provider_rejected", "failed", 502),
         ("failed", "failed", 503),
+        ("invalid_request", "failed", 422),
+        ("input_too_large", "failed", 413),
     ],
 )
 def test_outcome_http_status_and_body(kind, status, code):

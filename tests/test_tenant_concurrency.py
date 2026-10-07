@@ -23,7 +23,7 @@ from fastapi import HTTPException, Request
 from model_bridge import main
 from model_bridge.providers.contracts import GenerationResult
 from model_bridge.config.loader import SETTINGS
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import TenantRateLimiter
 from model_bridge.storage.request_store import RequestStore
 from model_bridge.config.models import Settings
 
@@ -177,12 +177,25 @@ def tenant_api(monkeypatch, tmp_path):
     data["tenant_defaults"]["max_concurrent_jobs"] = 2
     data["tenant_overrides"] = {"tenant-a": {"max_concurrent_jobs": 1}}
     settings = Settings.model_validate(data)
-    monkeypatch.setattr(main.app.state.chat_service, "settings", settings, raising=False)
-    monkeypatch.setattr(main.app.state.chat_service, "request_store", RequestStore(tmp_path / "requests.sqlite3"))
-    monkeypatch.setattr(main.app.state.chat_service, "chat_rate_limiter", SlidingWindowRateLimiter(100, 60))
-    generation = AsyncMock(return_value=GenerationResult(
-        "ok", "fake-fast", attempts=1, provider="fake",
-    ))
+    monkeypatch.setattr(
+        main.app.state.chat_service, "settings", settings, raising=False
+    )
+    monkeypatch.setattr(
+        main.app.state.chat_service,
+        "request_store",
+        RequestStore(tmp_path / "requests.sqlite3"),
+    )
+    monkeypatch.setattr(
+        main.app.state.chat_service, "chat_rate_limiter", TenantRateLimiter(100, 60)
+    )
+    generation = AsyncMock(
+        return_value=GenerationResult(
+            "ok",
+            "fake-fast",
+            attempts=1,
+            provider="fake",
+        )
+    )
     monkeypatch.setattr(main.app.state.chat_service, "generate", generation)
     return settings, generation
 
@@ -199,35 +212,52 @@ def configure_identity(monkeypatch):
             raise HTTPException(status_code=401, detail="Authentication required")
         return SimpleNamespace(id=tenant_id)
 
-    monkeypatch.setitem(main.app.dependency_overrides, dependency, authenticated_for_test)
+    monkeypatch.setitem(
+        main.app.dependency_overrides, dependency, authenticated_for_test
+    )
 
 
 # Keeps caller-supplied tenant metadata separate from the trusted authentication result.
 def payload(request_id, claimed_tenant):
-    return {"request_id": request_id, "tenant_id": claimed_tenant,
-            "message": "hello", "model_preference": "fast", "max_tokens": 10}
+    return {
+        "request_id": request_id,
+        "tenant_id": claimed_tenant,
+        "message": "hello",
+        "model_preference": "fast",
+        "max_tokens": 10,
+    }
 
 
 # Checks a configured override and the default allowance are enforced by the API.
 @pytest.mark.parametrize("tenant, expected_limit", [("tenant-a", 1), ("tenant-b", 2)])
-def test_api_resolves_authenticated_tenant_policy(tenant_api, monkeypatch, tenant, expected_limit):
+def test_api_resolves_authenticated_tenant_policy(
+    tenant_api, monkeypatch, tenant, expected_limit
+):
     settings, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
-    monkeypatch.setattr(main.app.state.chat_service, "generation_limiter", limiter, raising=False)
+    monkeypatch.setattr(
+        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+    )
     configure_identity(monkeypatch)
-    assert settings.effective_tenant_limits(tenant).max_concurrent_jobs == expected_limit
+    assert (
+        settings.effective_tenant_limits(tenant).max_concurrent_jobs == expected_limit
+    )
 
     # Fills only this tenant's allowance, verifies rejection, then retries the same ID.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+            transport=httpx.ASGITransport(app=main.app),
+            base_url="http://test",
         ) as client:
             with ExitStack() as held:
                 for _ in range(expected_limit):
-                    held.enter_context(limiter.slot(tenant_id=tenant, tenant_limit=expected_limit))
+                    held.enter_context(
+                        limiter.slot(tenant_id=tenant, tenant_limit=expected_limit)
+                    )
                 response = await client.post(
-                    "/chat", json=payload("tenant-retry", tenant),
+                    "/chat",
+                    json=payload("tenant-retry", tenant),
                     headers={"x-test-authenticated-tenant": tenant},
                 )
             assert response.status_code == 503
@@ -235,7 +265,8 @@ def test_api_resolves_authenticated_tenant_policy(tenant_api, monkeypatch, tenan
             assert int(response.headers["Retry-After"]) >= 1
             generation.assert_not_awaited()
             response = await client.post(
-                "/chat", json=payload("tenant-retry", tenant),
+                "/chat",
+                json=payload("tenant-retry", tenant),
                 headers={"x-test-authenticated-tenant": tenant},
             )
             assert response.status_code == 200
@@ -250,24 +281,29 @@ def test_body_tenant_spoofing_cannot_bypass_capacity(tenant_api, monkeypatch):
     _, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
-    monkeypatch.setattr(main.app.state.chat_service, "generation_limiter", limiter, raising=False)
+    monkeypatch.setattr(
+        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+    )
     configure_identity(monkeypatch)
 
     # Accepts either rejecting a mismatched identity or enforcing authenticated capacity.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+            transport=httpx.ASGITransport(app=main.app),
+            base_url="http://test",
         ) as client:
             with limiter.slot(tenant_id="tenant-a", tenant_limit=1):
                 for claimed in ("tenant-b", "default", "invented-tenant"):
                     response = await client.post(
-                        "/chat", json=payload(f"spoof-{claimed}", claimed),
+                        "/chat",
+                        json=payload(f"spoof-{claimed}", claimed),
                         headers={"x-test-authenticated-tenant": "tenant-a"},
                     )
                     assert response.status_code in {403, 503}
             generation.assert_not_awaited()
             response = await client.post(
-                "/chat", json=payload("honest-b", "tenant-b"),
+                "/chat",
+                json=payload("honest-b", "tenant-b"),
                 headers={"x-test-authenticated-tenant": "tenant-b"},
             )
             assert response.status_code == 200
@@ -284,7 +320,8 @@ def test_unauthenticated_request_does_not_generate(tenant_api, monkeypatch):
     # Sends a valid body without an authenticated identity and expects rejection.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+            transport=httpx.ASGITransport(app=main.app),
+            base_url="http://test",
         ) as client:
             response = await client.post("/chat", json=payload("anonymous", "tenant-a"))
             assert response.status_code == 401
@@ -298,21 +335,28 @@ def test_authenticated_cached_replay_bypasses_capacity(tenant_api, monkeypatch):
     _, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
-    monkeypatch.setattr(main.app.state.chat_service, "generation_limiter", limiter, raising=False)
+    monkeypatch.setattr(
+        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+    )
     configure_identity(monkeypatch)
 
     # Saves a result and then replays it while every generation slot is occupied.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+            transport=httpx.ASGITransport(app=main.app),
+            base_url="http://test",
         ) as client:
             headers = {"x-test-authenticated-tenant": "tenant-a"}
             body = payload("tenant-cached", "tenant-a")
-            assert (await client.post("/chat", json=body, headers=headers)).status_code == 200
+            assert (
+                await client.post("/chat", json=body, headers=headers)
+            ).status_code == 200
             with ExitStack() as held:
                 held.enter_context(limiter.slot(tenant_id="tenant-a", tenant_limit=1))
                 for _ in range(2):
-                    held.enter_context(limiter.slot(tenant_id="tenant-b", tenant_limit=2))
+                    held.enter_context(
+                        limiter.slot(tenant_id="tenant-b", tenant_limit=2)
+                    )
                 response = await client.post("/chat", json=body, headers=headers)
             assert response.status_code == 200
             assert response.json()["cache_hit"] is True

@@ -1,0 +1,42 @@
+{
+  "reviewed_on": "2026-10-06",
+  "currency": "USD",
+  "unit": "per million tokens",
+  "purpose": "Source catalogue; application rates remain in config.json",
+  "models": {
+    "gpt-5.5": {
+      "provider": "openai",
+      "status": "verified",
+      "input": 5.0,
+      "cached_input": 0.5,
+      "output": 30.0,
+      "source": "https://developers.openai.com/api/docs/models/gpt-5.5",
+      "scope": "Standard API text tokens, input up to 272000 tokens, no regional uplift",
+      "limitations": "Current estimator uses uncached input rates. Above 272000 input tokens the documented rates are 2x input and 1.5x output. Cached input, other service tiers, regional uplifts, and tool charges require separate accounting."
+    },
+    "gpt-6.0": {
+      "provider": "openai",
+      "status": "unverified_exact_identifier",
+      "input": null,
+      "output": null,
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "reason": "No official price found for this exact identifier. Do not substitute GPT-6 family rates or infer model availability."
+    },
+    "smollm2:135m": {
+      "provider": "ollama",
+      "status": "local_infrastructure_cost_unknown",
+      "input": null,
+      "output": null,
+      "source": "https://ollama.com/pricing",
+      "reason": "Configured for local execution. Local use has no Ollama token charge; hardware and operating costs are not measured, so total estimated cost remains unknown."
+    },
+    "llama3.1:8b": {
+      "provider": "ollama",
+      "status": "local_infrastructure_cost_unknown",
+      "input": null,
+      "output": null,
+      "source": "https://ollama.com/pricing",
+      "reason": "Configured for local execution. Local use has no Ollama token charge; hardware and operating costs are not measured, so total estimated cost remains unknown."
+    }
+  }
+}

@@ -20,18 +20,30 @@ from model_bridge.execution.generation import llm_call
 from model_bridge.main import app
 from model_bridge.providers.contracts import GenerationResult
 from model_bridge.providers.contracts import RetryableProviderError
+from model_bridge.providers.contracts import PermanentProviderError
+from model_bridge.application.outcomes import ChatCommand
 from model_bridge.providers.fake import FakeProvider
 from model_bridge.execution.circuit_breaker import CircuitBreaker
 from model_bridge.storage.request_store import RequestStore
+
+
 # Gives API tests fake providers and prevents configured fallback calls.
 @pytest.fixture(autouse=True)
 def isolated_api_providers(monkeypatch):
-    monkeypatch.setattr(main_module.app.state.chat_service, "primary_provider", FakeProvider())
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "primary_provider", FakeProvider()
+    )
     monkeypatch.setattr(main_module.app.state.chat_service, "backup_provider", None)
     monkeypatch.setattr(main_module.app.state.chat_service, "provider_name", "fake")
-    monkeypatch.setattr(main_module.app.state.chat_service, "fallback_provider_name", None)
-    monkeypatch.setattr(main_module.app.state.chat_service, "primary_breaker", CircuitBreaker())
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "fallback_provider_name", None
+    )
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "primary_breaker", CircuitBreaker()
+    )
     monkeypatch.setattr(main_module.app.state.chat_service, "backup_breaker", None)
+
+
 # Replaces only the limiter clock so tests can advance time without waiting.
 @pytest.fixture
 def limiter_clock(monkeypatch):
@@ -43,6 +55,8 @@ def limiter_clock(monkeypatch):
         SimpleNamespace(monotonic=lambda: now[0]),
     )
     return now
+
+
 # Gives each test a fresh limiter so admission history cannot leak between tests.
 @pytest.fixture(autouse=True)
 def isolated_rate_limiter(monkeypatch):
@@ -52,6 +66,8 @@ def isolated_rate_limiter(monkeypatch):
         "chat_rate_limiter",
         SlidingWindowRateLimiter(limit=100, window_seconds=60),
     )
+
+
 # Records request IDs, attempt numbers, and messages while returning predictable fake responses.
 class RecordingFakeProvider(FakeProvider):
     # Initializes the list used to inspect provider calls.
@@ -167,7 +183,6 @@ class FallbackFakeProvider:
         )
 
 
-
 # Builds a minimal valid chat payload with a supplied request ID and message.
 def request_payload(request_id: str, message: str = "hello") -> dict[str, object]:
     return {
@@ -196,7 +211,9 @@ def test_post_response_is_normalized_and_duplicate_replays_saved_response(
     isolated_request_store,
 ) -> None:
     provider = RecordingFakeProvider()
-    monkeypatch.setattr(main_module.app.state.chat_service, "primary_provider", provider)
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "primary_provider", provider
+    )
     payload = request_payload(f"pytest-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -228,7 +245,9 @@ def test_reusing_request_id_with_different_payload_returns_conflict(
     isolated_request_store,
 ) -> None:
     provider = RecordingFakeProvider()
-    monkeypatch.setattr(main_module.app.state.chat_service, "primary_provider", provider)
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "primary_provider", provider
+    )
     payload = request_payload(f"pytest-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -359,7 +378,9 @@ def test_unknown_provider_outcome_is_persisted_and_not_called_again(
     isolated_request_store,
 ) -> None:
     provider = UnknownOutcomeFakeProvider()
-    monkeypatch.setattr(main_module.app.state.chat_service, "primary_provider", provider)
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "primary_provider", provider
+    )
     payload = request_payload(f"pytest-unknown-{uuid4().hex}")
 
     with TestClient(app) as client:
@@ -402,6 +423,7 @@ def test_task_routing_uses_requirements_and_flags_high_risk(
     assert response.json()["model"] == expected_model
     assert response.json()["human_review_required"] is human_review
 
+
 # Checks that 12 competing threads admit exactly 3 requests under a shared rate limit.
 def test_simultaneous_acquisition_respects_limit(limiter_clock):
     limiter = SlidingWindowRateLimiter(limit=3, window_seconds=10)
@@ -418,6 +440,7 @@ def test_simultaneous_acquisition_respects_limit(limiter_clock):
 
     assert results.count(None) == 3
     assert results.count(10) == 9
+
 
 # Checks saved evaluation versions, model identity, result labels, and unavailable cost reporting.
 def test_evaluation_runner_persists_versions_labels_and_usage(
@@ -463,9 +486,7 @@ def test_evaluation_runner_persists_versions_labels_and_usage(
         )
         assert saved_summary == summary
         result_path = next((root / "results").glob("*.jsonl"))
-        result = json.loads(
-            result_path.read_text(encoding="utf-8").splitlines()[0]
-        )
+        result = json.loads(result_path.read_text(encoding="utf-8").splitlines()[0])
 
     assert summary["dataset_version"] == "unit-v1"
     assert summary["prompt_version"] == "prompt-v7"
@@ -486,17 +507,27 @@ def test_api_shares_circuit_state_across_requests(
     same_backend_fallback,
 ):
     breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30)
-    primary = SimpleNamespace(complete=AsyncMock(side_effect=RetryableProviderError(
-        "backend unavailable", status_code=503, failure_type="http_503"
-    )))
+    primary = SimpleNamespace(
+        complete=AsyncMock(
+            side_effect=RetryableProviderError(
+                "backend unavailable", status_code=503, failure_type="http_503"
+            )
+        )
+    )
     backup = RecordingFakeProvider()
     monkeypatch.setattr(main_module.app.state.chat_service, "primary_provider", primary)
     monkeypatch.setattr(main_module.app.state.chat_service, "primary_breaker", breaker)
     monkeypatch.setattr(main_module.app.state.chat_service, "retry_delay_seconds", 0)
     if same_backend_fallback:
-        monkeypatch.setattr(main_module.app.state.chat_service, "backup_provider", backup)
-        monkeypatch.setattr(main_module.app.state.chat_service, "fallback_provider_name", "fake")
-        monkeypatch.setattr(main_module.app.state.chat_service, "backup_breaker", breaker)
+        monkeypatch.setattr(
+            main_module.app.state.chat_service, "backup_provider", backup
+        )
+        monkeypatch.setattr(
+            main_module.app.state.chat_service, "fallback_provider_name", "fake"
+        )
+        monkeypatch.setattr(
+            main_module.app.state.chat_service, "backup_breaker", breaker
+        )
 
     with TestClient(app) as client:
         first = client.post("/chat", json=request_payload("trip-circuit"))
@@ -522,12 +553,14 @@ def test_rate_limit_returns_retry_after(
     limiter_clock[0] = 100.2
 
     claim = Mock(side_effect=AssertionError("Database must not be called"))
-    generate = AsyncMock(
-        side_effect=AssertionError("Provider must not be called")
-    )
+    generate = AsyncMock(side_effect=AssertionError("Provider must not be called"))
 
-    monkeypatch.setattr(main_module.app.state.chat_service, "chat_rate_limiter", limiter)
-    monkeypatch.setattr(main_module.app.state.chat_service.request_store, "claim", claim)
+    monkeypatch.setattr(
+        main_module.app.state.chat_service, "chat_rate_limiter", limiter
+    )
+    monkeypatch.setattr(
+        main_module.app.state.chat_service.request_store, "claim", claim
+    )
     monkeypatch.setattr(main_module.app.state.chat_service, "generate", generate)
 
     with TestClient(app) as client:
@@ -541,3 +574,193 @@ def test_rate_limit_returns_retry_after(
     assert response.json()["attempts"] == 0
     claim.assert_not_called()
     generate.assert_not_called()
+
+
+# Builds the proposed combined limiter without causing collection errors before implementation.
+def combined_limiter(now, *, platform_limit=3, platform_window=10):
+    limiter_type = getattr(rate_limit_module, "TenantRateLimiter", None)
+    assert callable(limiter_type), (
+        "Implement TenantRateLimiter for atomic tenant/platform admission"
+    )
+    return limiter_type(
+        platform_limit=platform_limit,
+        platform_window_seconds=platform_window,
+        clock=lambda: now[0],
+    )
+
+
+# Checks tenant rejection consumes neither quota and another tenant remains eligible.
+def test_combined_rate_limit_tenant_rejection_preserves_platform_quota():
+    limiter = combined_limiter([0.0])
+    assert limiter.try_acquire("a", limit=2, window_seconds=10) is None
+    assert limiter.try_acquire("a", limit=2, window_seconds=10) is None
+    assert limiter.try_acquire("a", limit=2, window_seconds=10) == 10
+    assert limiter.try_acquire("b", limit=2, window_seconds=10) is None
+    assert limiter.try_acquire("b", limit=2, window_seconds=10) == 10
+
+
+# Checks platform rejection does not consume a tenant's longer-window allowance.
+def test_combined_rate_limit_platform_rejection_preserves_tenant_quota():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=1)
+    assert limiter.try_acquire("a", limit=1, window_seconds=20) is None
+    assert limiter.try_acquire("b", limit=1, window_seconds=20) == 10
+    assert "b" not in limiter.active_tenant_ids
+    now[0] = 10
+    assert limiter.try_acquire("b", limit=1, window_seconds=20) is None
+
+
+# Checks competing tenants cannot exceed either limit during simultaneous admission.
+def test_combined_rate_limit_simultaneous_admission():
+    limiter = combined_limiter([0.0], platform_limit=3)
+    barrier = Barrier(12)
+
+    # Releases all callers together and returns which tenant was admitted.
+    def admit(index):
+        tenant = "a" if index < 6 else "b"
+        barrier.wait(timeout=3)
+        return (
+            tenant
+            if limiter.try_acquire(tenant, limit=2, window_seconds=10) is None
+            else None
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        accepted = [
+            tenant for tenant in pool.map(admit, range(12)) if tenant is not None
+        ]
+    assert len(accepted) == 3
+    assert accepted.count("a") <= 2
+    assert accepted.count("b") <= 2
+
+
+# Checks exact window expiry and rounded retry guidance without sleeping.
+def test_combined_rate_limit_expiry_and_retry_after():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=1)
+    assert limiter.try_acquire("a", limit=1, window_seconds=10) is None
+    now[0] = 0.2
+    assert limiter.try_acquire("a", limit=1, window_seconds=10) == 10
+    now[0] = 10
+    assert limiter.try_acquire("a", limit=1, window_seconds=10) is None
+
+
+# Checks lazy cleanup removes an inactive tenant and respects different window lengths.
+def test_combined_rate_cleanup_respects_each_tenant_window():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=100)
+    assert limiter.try_acquire("a", limit=2, window_seconds=10) is None
+    assert limiter.try_acquire("b", limit=2, window_seconds=20) is None
+    now[0] = 10
+    assert limiter.try_acquire("c", limit=2, window_seconds=10) is None
+    assert set(limiter.active_tenant_ids) == {"b", "c"}
+    now[0] = 20
+    assert limiter.try_acquire("d", limit=2, window_seconds=10) is None
+    assert set(limiter.active_tenant_ids) == {"d"}
+
+
+# Checks cleanup under contention does not lose admissions or retain expired tenants.
+def test_combined_rate_cleanup_is_atomic_with_admission():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=3)
+    assert limiter.try_acquire("expired", limit=1, window_seconds=10) is None
+    now[0] = 10
+    barrier = Barrier(6)
+
+    # Starts cleanup and admission together for one shared tenant.
+    def admit(_):
+        barrier.wait(timeout=3)
+        return limiter.try_acquire("new", limit=2, window_seconds=10)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(admit, range(6)))
+    assert results.count(None) == 2
+    assert set(limiter.active_tenant_ids) == {"new"}
+    assert limiter.try_acquire("other", limit=1, window_seconds=10) is None
+    assert limiter.try_acquire("blocked", limit=1, window_seconds=10) == 10
+    assert "blocked" not in limiter.active_tenant_ids
+
+
+# Checks Retry-After waits for both quotas, without charging rejected attempts to either.
+def test_combined_rate_retry_after_covers_both_windows():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=1)
+    assert limiter.try_acquire("a", limit=1, window_seconds=20) is None
+    now[0] = 0.2
+    assert limiter.try_acquire("a", limit=1, window_seconds=20) == 20
+    now[0] = 10
+    assert limiter.try_acquire("a", limit=1, window_seconds=20) == 10
+    assert limiter.try_acquire("b", limit=1, window_seconds=10) is None
+    now[0] = 20
+    assert limiter.try_acquire("a", limit=1, window_seconds=20) is None
+
+
+# Checks lazy cleanup still runs when the platform quota rejects a new tenant.
+def test_combined_rate_rejection_still_cleans_expired_histories():
+    now = [0.0]
+    limiter = combined_limiter(now, platform_limit=1)
+    assert limiter.try_acquire("expired", limit=1, window_seconds=5) is None
+    now[0] = 5
+    assert limiter.try_acquire("new", limit=1, window_seconds=10) == 5
+    assert set(limiter.active_tenant_ids) == set()
+
+
+# Checks the service enforces a tenant quota before storage or provider work.
+def test_service_tenant_rate_limit_precedes_storage(policy_service):
+    service = policy_service(
+        tenant={"rate_limit": {"requests": 2, "window_seconds": 10}}
+    )
+    claim = Mock(wraps=service.request_store.claim)
+    service.request_store.claim = claim
+
+    # Submits three different requests for one tenant, then a request for another.
+    async def scenario():
+        results = [
+            await service.handle(ChatCommand(str(i), "a", "hello", "fast", 10))
+            for i in range(3)
+        ]
+        assert [result.kind for result in results] == [
+            "success",
+            "success",
+            "rate_limited",
+        ]
+        assert results[-1].retry_after == 10
+        assert claim.call_count == service.generate.await_count == 2
+        assert (
+            await service.handle(ChatCommand("b", "b", "hello", "fast", 10))
+        ).kind == "success"
+
+    asyncio.run(scenario())
+
+
+# Checks rate admissions are retained for replay, conflicts, and later provider failures.
+@pytest.mark.parametrize("result_type", ["replay", "conflict", "provider_failure"])
+def test_admitted_requests_do_not_refund_tenant_rate_quota(policy_service, result_type):
+    service = policy_service(
+        tenant={"rate_limit": {"requests": 2, "window_seconds": 60}}
+    )
+    if result_type == "provider_failure":
+        service.generate = AsyncMock(side_effect=PermanentProviderError("rejected"))
+
+    # Consumes two admissions through the selected outcome and checks the third rejection.
+    async def scenario():
+        original = ChatCommand("id", "a", "hello", "fast", 10)
+        await service.handle(original)
+        second = original
+        if result_type == "conflict":
+            second = ChatCommand("id", "a", "changed", "fast", 10)
+        elif result_type == "provider_failure":
+            second = ChatCommand("second", "a", "hello", "fast", 10)
+        result = await service.handle(second)
+        assert (
+            result.kind
+            == {
+                "replay": "success",
+                "conflict": "conflict",
+                "provider_failure": "provider_rejected",
+            }[result_type]
+        )
+        rejected = await service.handle(ChatCommand("third", "a", "hello", "fast", 10))
+        assert rejected.kind == "rate_limited"
+
+    asyncio.run(scenario())

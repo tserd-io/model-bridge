@@ -1,6 +1,7 @@
 """Health probes tested against temporary databases, without model calls."""
 
 import sqlite3
+import time
 import pytest
 from fastapi.testclient import TestClient
 
@@ -16,7 +17,9 @@ def health_app(monkeypatch, tmp_path):
     from model_bridge import main
     from model_bridge.storage.request_store import RequestStore
 
-    monkeypatch.setattr(main.app.state.chat_service, "request_store", RequestStore(database_path))
+    monkeypatch.setattr(
+        main.app.state.chat_service, "request_store", RequestStore(database_path)
+    )
 
     # Fails immediately if a health probe attempts generation.
     async def unexpected_model_call(*args, **kwargs):
@@ -72,9 +75,7 @@ def test_readiness_with_unavailable_database(
     )
     response = client.get("/health/ready")
     assert response.status_code == 503
-    assert response.json() == {
-        "status": "not_ready", "checks": {"database": "failed"}
-    }
+    assert response.json() == {"status": "not_ready", "checks": {"database": "failed"}}
     assert client.get("/health/live").status_code == 200
     if database_state == "missing":
         assert not database_path.exists()
@@ -96,3 +97,24 @@ def test_readiness_recovers_after_database_returns(health_app, monkeypatch, tmp_
         healthy_path,
     )
     assert client.get("/health/ready").status_code == 200
+
+
+# Checks a long normal-storage timeout does not make readiness wait for that full period.
+def test_readiness_timeout_is_independent_of_storage_busy_timeout(policy_service):
+    service = policy_service(storage={"busy_timeout_seconds": 30})
+    from model_bridge import main
+
+    blocker = sqlite3.connect(service.request_store.database_path)
+    try:
+        # DELETE journaling and an exclusive lock block readers, unlike an ordinary WAL writer.
+        blocker.execute("PRAGMA journal_mode=DELETE")
+        blocker.execute("BEGIN EXCLUSIVE")
+        with TestClient(main.app) as client:
+            started = time.monotonic()
+            response = client.get("/health/ready")
+            elapsed = time.monotonic() - started
+        assert response.status_code == 503
+        assert elapsed < 3
+    finally:
+        blocker.rollback()
+        blocker.close()

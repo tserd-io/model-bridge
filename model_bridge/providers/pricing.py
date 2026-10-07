@@ -1,7 +1,9 @@
 from model_bridge.config.loader import MODEL_PRICING_USD_PER_MILLION_TOKENS
 
 
-# Estimates token cost from per-million rates, or returns None when pricing or usage is missing.
+# Estimates standard uncached token cost using configured rates. None means
+# unknown, not free: missing pricing or either usage count must remain unknown.
+# This is not invoice accounting (cache discounts, tiers and tools are excluded).
 def estimate_cost_usd(
     model: str,
     input_tokens: int | None,

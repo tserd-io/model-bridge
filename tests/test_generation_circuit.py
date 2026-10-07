@@ -9,6 +9,9 @@ from model_bridge.providers.contracts import GenerationResult
 from model_bridge.providers.contracts import PermanentProviderError
 from model_bridge.providers.contracts import ProviderOutcomeUnknown
 from model_bridge.providers.contracts import RetryableProviderError
+from model_bridge.application.outcomes import ChatCommand
+from model_bridge.config.models import Settings
+from model_bridge import main
 
 
 # Creates a controllable breaker that opens after one counted failure.
@@ -22,7 +25,10 @@ def breaker_clock():
 # Invokes generation with deterministic retry delays and explicit fake dependencies.
 async def generate(provider, breaker, **kwargs):
     return await generation.llm_call(
-        "circuit-test", "private prompt", "fast", 10,
+        "circuit-test",
+        "private prompt",
+        "fast",
+        10,
         provider=provider,
         provider_name="fake",
         circuit_breaker=breaker,
@@ -58,17 +64,20 @@ def test_open_primary_can_use_independent_fallback(breaker_clock):
     breaker, _ = breaker_clock
     breaker.finish(breaker.acquire(), "failure")
     primary = SimpleNamespace(complete=AsyncMock())
-    fallback = SimpleNamespace(complete=AsyncMock(
-        return_value=GenerationResult("ok", "fallback-model")
-    ))
+    fallback = SimpleNamespace(
+        complete=AsyncMock(return_value=GenerationResult("ok", "fallback-model"))
+    )
 
-    result = asyncio.run(generate(
-        primary, breaker,
-        max_attempts=1,
-        fallback_provider=fallback,
-        fallback_provider_name="other",
-        fallback_circuit_breaker=CircuitBreaker(),
-    ))
+    result = asyncio.run(
+        generate(
+            primary,
+            breaker,
+            max_attempts=1,
+            fallback_provider=fallback,
+            fallback_provider_name="other",
+            fallback_circuit_breaker=CircuitBreaker(),
+        )
+    )
 
     primary.complete.assert_not_awaited()
     assert fallback.complete.await_args.kwargs["attempt"] == 1
@@ -79,21 +88,116 @@ def test_open_primary_can_use_independent_fallback(breaker_clock):
 # Prevents a second adapter for the same backend from bypassing the open circuit.
 def test_same_backend_fallback_shares_breaker(breaker_clock):
     breaker, _ = breaker_clock
-    primary = SimpleNamespace(complete=AsyncMock(side_effect=RetryableProviderError(
-        "unavailable", status_code=503, failure_type="http_503"
-    )))
+    primary = SimpleNamespace(
+        complete=AsyncMock(
+            side_effect=RetryableProviderError(
+                "unavailable", status_code=503, failure_type="http_503"
+            )
+        )
+    )
     fallback = SimpleNamespace(complete=AsyncMock())
 
     with pytest.raises(generation.CircuitUnavailableError) as error:
-        asyncio.run(generate(
-            primary, breaker,
-            fallback_provider=fallback,
-            fallback_provider_name="fake",
-        ))
+        asyncio.run(
+            generate(
+                primary,
+                breaker,
+                fallback_provider=fallback,
+                fallback_provider_name="fake",
+            )
+        )
 
     assert error.value.attempts == 1
     assert primary.complete.await_count == 1
     fallback.complete.assert_not_awaited()
+
+
+# Checks fallback timeout changes with the active provider while budget and backoff stay shared.
+@pytest.mark.parametrize("deadline", [5, 20])
+def test_configured_fallback_timeout_and_shared_budget(
+    policy_service, monkeypatch, deadline
+):
+    initial = policy_service(tenant={"request_deadline_seconds": deadline})
+    data = initial.settings.model_dump()
+    data["providers"]["fake"]["attempt_timeout_seconds"] = 3
+    data["providers"]["fake"]["retry_base_delay_seconds"] = 0.25
+    data["providers"]["backup"] = {
+        "type": "fake",
+        "attempt_timeout_seconds": 8,
+        "max_attempts": 10,
+        "retry_base_delay_seconds": 2,
+    }
+    data["fallback_provider"] = "backup"
+    service = main.create_chat_service(Settings.model_validate(data))
+    now = [0.0]
+    delays = []
+
+    # Advances deterministic retry time instead of sleeping.
+    async def sleep(delay):
+        delays.append(delay)
+        now[0] += delay
+
+    monkeypatch.setattr(
+        generation,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now[0]),
+            TimeoutError=asyncio.TimeoutError,
+            sleep=sleep,
+        ),
+    )
+    monkeypatch.setattr(generation.random, "uniform", lambda low, high: high)
+
+    # Consumes one second before switching to the independently configured fallback.
+    async def primary(**kwargs):
+        now[0] += 1
+        raise RetryableProviderError("busy", status_code=429, failure_type="http_429")
+
+    calls = []
+
+    # Fails once and then succeeds, recording actual provider timeout and attempt values.
+    async def fallback(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RetryableProviderError(
+                "busy", status_code=429, failure_type="http_429"
+            )
+        return GenerationResult("recovered", "backup-fast")
+
+    service.primary_provider = SimpleNamespace(complete=AsyncMock(side_effect=primary))
+    service.backup_provider = SimpleNamespace(complete=AsyncMock(side_effect=fallback))
+    result = asyncio.run(
+        service.handle(ChatCommand("timeouts", "a", "hello", "fast", 10))
+    )
+    assert result.kind == "success"
+    assert service.primary_provider.complete.await_args.kwargs["timeout"] == 3
+    assert [call["attempt"] for call in calls] == [2, 3]
+    assert [call["timeout"] for call in calls] == [
+        min(8, deadline - 1),
+        min(8, deadline - 1.5),
+    ]
+    assert delays == [0.5]
+    assert result.response.attempts == 3
+
+
+# Checks a fallback's larger configured retry allowance cannot extend the shared call budget.
+def test_fallback_setting_cannot_expand_total_attempt_budget(policy_service):
+    initial = policy_service()
+    data = initial.settings.model_dump()
+    data["providers"]["fake"]["max_attempts"] = 2
+    data["providers"]["backup"] = {"type": "fake", "max_attempts": 10}
+    data["fallback_provider"] = "backup"
+    service = main.create_chat_service(Settings.model_validate(data))
+    primary = AsyncMock(side_effect=RetryableProviderError("busy", status_code=429))
+    backup = AsyncMock(side_effect=RetryableProviderError("busy", status_code=429))
+    service.primary_provider = SimpleNamespace(complete=primary)
+    service.backup_provider = SimpleNamespace(complete=backup)
+    result = asyncio.run(
+        service.handle(ChatCommand("budget", "a", "hello", "fast", 10))
+    )
+    assert result.kind == "failed"
+    assert primary.await_count + backup.await_count == 2
+    assert result.response.attempts == 2
 
 
 # Rejects contradictory breaker wiring instead of allowing same-backend bypass.
@@ -101,12 +205,15 @@ def test_same_backend_cannot_have_separate_breakers(breaker_clock):
     breaker, _ = breaker_clock
     provider = SimpleNamespace(complete=AsyncMock())
     with pytest.raises(ValueError, match="same backend"):
-        asyncio.run(generate(
-            provider, breaker,
-            fallback_provider=SimpleNamespace(complete=AsyncMock()),
-            fallback_provider_name="fake",
-            fallback_circuit_breaker=CircuitBreaker(),
-        ))
+        asyncio.run(
+            generate(
+                provider,
+                breaker,
+                fallback_provider=SimpleNamespace(complete=AsyncMock()),
+                fallback_provider_name="fake",
+                fallback_circuit_breaker=CircuitBreaker(),
+            )
+        )
     provider.complete.assert_not_awaited()
 
 
@@ -125,10 +232,16 @@ def test_timeout_uncertainty_survives_circuit_rejection(breaker_clock):
 # Keeps rate-limit retries separate from the provider-outage breaker.
 def test_rate_limit_does_not_open_circuit(breaker_clock):
     breaker, _ = breaker_clock
-    provider = SimpleNamespace(complete=AsyncMock(side_effect=[
-        RetryableProviderError("limited", status_code=429, failure_type="http_429"),
-        GenerationResult("ok", "fake-fast"),
-    ]))
+    provider = SimpleNamespace(
+        complete=AsyncMock(
+            side_effect=[
+                RetryableProviderError(
+                    "limited", status_code=429, failure_type="http_429"
+                ),
+                GenerationResult("ok", "fake-fast"),
+            ]
+        )
+    )
     result = asyncio.run(generate(provider, breaker))
     assert result.attempts == 2
     assert breaker.state == "closed"
@@ -172,17 +285,22 @@ def test_cancelled_probe_can_recover_after_cooldown(breaker_clock, monkeypatch):
         if call.args == ("circuit_state_changed",)
     ]
     assert transitions == [
-        ("open", "half_open"), ("half_open", "open"),
-        ("open", "half_open"), ("half_open", "closed"),
+        ("open", "half_open"),
+        ("half_open", "open"),
+        ("open", "half_open"),
+        ("half_open", "closed"),
     ]
 
 
 # Unexpected, permanent, and explicitly uncertain failures release probe admission.
-@pytest.mark.parametrize("error", [
-    RuntimeError("local bug"),
-    PermanentProviderError("unauthorized"),
-    ProviderOutcomeUnknown("response lost"),
-])
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("local bug"),
+        PermanentProviderError("unauthorized"),
+        ProviderOutcomeUnknown("response lost"),
+    ],
+)
 def test_non_outage_errors_release_probe(breaker_clock, error):
     breaker, now = breaker_clock
     breaker.finish(breaker.acquire(), "failure")
@@ -197,27 +315,36 @@ def test_non_outage_errors_release_probe(breaker_clock, error):
 def test_deadline_is_not_reset_for_fallback(breaker_clock, monkeypatch):
     breaker, _ = breaker_clock
     now = [0.0]
-    monkeypatch.setattr(generation, "asyncio", SimpleNamespace(
-        get_running_loop=lambda: SimpleNamespace(time=lambda: now[0]),
-        TimeoutError=asyncio.TimeoutError,
-        sleep=asyncio.sleep,
-    ))
+    monkeypatch.setattr(
+        generation,
+        "asyncio",
+        SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: now[0]),
+            TimeoutError=asyncio.TimeoutError,
+            sleep=asyncio.sleep,
+        ),
+    )
 
     # Advances beyond the deadline before reporting an uncertain failure.
     async def slow_failure(**kwargs):
         now[0] = 6.0
-        raise RetryableProviderError("timeout", failure_type="timeout", outcome_unknown=True)
+        raise RetryableProviderError(
+            "timeout", failure_type="timeout", outcome_unknown=True
+        )
 
     primary = SimpleNamespace(complete=AsyncMock(side_effect=slow_failure))
     fallback = SimpleNamespace(complete=AsyncMock())
     with pytest.raises(RetryableProviderError) as error:
-        asyncio.run(generate(
-            primary, breaker,
-            request_deadline_seconds=5,
-            fallback_provider=fallback,
-            fallback_provider_name="other",
-            fallback_circuit_breaker=CircuitBreaker(),
-        ))
+        asyncio.run(
+            generate(
+                primary,
+                breaker,
+                request_deadline_seconds=5,
+                fallback_provider=fallback,
+                fallback_provider_name="other",
+                fallback_circuit_breaker=CircuitBreaker(),
+            )
+        )
     assert error.value.failure_type == "deadline_exceeded"
     assert error.value.attempts == 1
     assert error.value.outcome_unknown is True
