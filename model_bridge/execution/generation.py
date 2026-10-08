@@ -1,7 +1,9 @@
 import asyncio
 import random
+import math
 import time
 from dataclasses import replace
+from model_bridge.providers.transport import run_with_attempt_timeout
 
 from model_bridge.execution.circuit_breaker import CircuitBreaker
 from model_bridge.execution.circuit_breaker import CircuitOpenError
@@ -30,13 +32,16 @@ async def complete_attempt(
 ) -> GenerationResult:
     """Convert raw timeouts into the gateway's standard transient error."""
     try:
-        return await provider.complete(
-            request_id=request_id,
-            attempt=attempt,
-            message=message,
-            model_preference=model_preference,
-            max_tokens=max_tokens,
-            timeout=timeout,
+        return await run_with_attempt_timeout(
+            provider.complete(
+                request_id=request_id,
+                attempt=attempt,
+                message=message,
+                model_preference=model_preference,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            ),
+            timeout,
         )
     except asyncio.TimeoutError as exc:
         raise RetryableProviderError(
@@ -76,7 +81,9 @@ def _counts_as_circuit_failure(error: RetryableProviderError) -> bool:
         error.failure_type in {"timeout", "connection_error"}
         or error.status_code in {408, 500, 502, 503, 504}
     )
-
+# Signals that local admission used the remaining time before any provider call began.
+class _AttemptDeadlineExpired(Exception):
+    pass
 
 # Completes an admitted call and releases its permit on every exit, including cancellation.
 async def _complete_admitted_attempt(
@@ -93,6 +100,7 @@ async def _complete_admitted_attempt(
     timeout: float,
     route: str,
     tenant_id: str,
+    deadline:float,
 ) -> GenerationResult:
     outcome: CallOutcome = "ignored"
     try:
@@ -115,6 +123,10 @@ async def _complete_admitted_attempt(
             attempt=attempt,
             timeout_ms=round(timeout * 1000),
         )
+        # Admission and synchronous logging can consume the remaining generation budget.
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise _AttemptDeadlineExpired
         result = await complete_attempt(
             provider,
             request_id=request_id,
@@ -122,7 +134,7 @@ async def _complete_admitted_attempt(
             message=message,
             model_preference=model_preference,
             max_tokens=max_tokens,
-            timeout=timeout,
+            timeout=min(remaining, timeout),
         )
         outcome = "success"
         return result
@@ -160,10 +172,21 @@ async def llm_call(
     route: str = "default",
     tenant_id: str = "default",
     timeout_seconds: float = 30,
+    fallback_timeout_seconds: float | None = None,
     request_deadline_seconds: float = 45,
     max_attempts: int = 3,
     retry_base_delay_seconds: float = 0.25,
 ) -> GenerationResult:
+    fallback_timeout = (
+        timeout_seconds
+        if fallback_timeout_seconds is None
+        else fallback_timeout_seconds
+    )
+    for budget in (timeout_seconds, fallback_timeout, request_deadline_seconds):
+        if not math.isfinite(budget) or budget <= 0:
+            raise ValueError("Timeouts and deadlines must be positive and finite")
+    if not math.isfinite(retry_base_delay_seconds) or retry_base_delay_seconds < 0:
+        raise ValueError("Retry delay must be nonnegative and finite")
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     if fallback_provider is not None and not fallback_provider_name:
@@ -187,6 +210,7 @@ async def llm_call(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + request_deadline_seconds
     last_error: Exception | None = None
+    active_timeout = timeout_seconds
     active_provider = provider
     active_provider_name = provider_name
     active_breaker = circuit_breaker
@@ -206,7 +230,7 @@ async def llm_call(
 
     # Selects fallback once without consuming a provider-call attempt.
     def select_fallback(error_type: str, status_code: int) -> bool:
-        nonlocal active_provider, active_provider_name, active_breaker, fallback_used
+        nonlocal active_provider, active_provider_name, active_breaker, fallback_used, active_timeout
         if fallback_provider is None or fallback_used:
             return False
         record_fallback(
@@ -266,9 +290,23 @@ async def llm_call(
                     provider=active_provider_name,
                     model=_metric_model(active_provider_name, model_preference),
                 ) from exc
-
+        remaining_seconds = deadline - loop.time()
+        if remaining_seconds <= 0:
+            if active_breaker is not None and permit is not None:
+                transition = active_breaker.finish(permit, "ignored")
+                if transition is not None:
+                    previous, current = transition
+                    log_event(
+                        "circuit_state_changed",
+                        request_id=request_id,
+                        provider=active_provider_name,
+                        previous_state=previous,
+                        state=current,
+                    )
+            raise deadline_error(attempt) from last_error
         attempt += 1
-        attempt_timeout = min(timeout_seconds, remaining_seconds)
+        active_timeout = fallback_timeout if fallback_used else timeout_seconds
+        attempt_timeout = min(active_timeout, remaining_seconds)
         attempt_started = time.perf_counter()
         model_name = _metric_model(active_provider_name, model_preference)
         try:
@@ -283,9 +321,14 @@ async def llm_call(
                 model_preference=model_preference,
                 max_tokens=max_tokens,
                 timeout=attempt_timeout,
+                deadline=deadline,
                 route=route,
                 tenant_id=tenant_id,
             )
+        except _AttemptDeadlineExpired:
+            # The permit was released as ignored; preserve only actual calls and earlier uncertainty.
+            attempt -= 1
+            raise deadline_error(attempt) from last_error
         except ProviderOutcomeUnknown as exc:
             # Stop further attempts because completion is explicitly uncertain; preserve the attempt count.
             _record_attempt(
@@ -436,6 +479,7 @@ def _record_attempt(
     )
     log_event(
         "provider_attempt_finished",
+        level="info" if status == "success" else "warning",
         request_id=request_id,
         provider=provider_name,
         attempt=attempt,

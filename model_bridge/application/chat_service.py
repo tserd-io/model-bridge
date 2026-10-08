@@ -16,10 +16,12 @@ from model_bridge.execution.concurrency_limit import (
     ConcurrencyLimitExceeded,
     GenerationConcurrencyLimiter,
 )
-from model_bridge.execution.rate_limit import SlidingWindowRateLimiter
+from model_bridge.execution.rate_limit import TenantAdmissionLimiter
+from model_bridge.application.request_policy import validate_request_policy
 from model_bridge.observability.logging import log_event
 from model_bridge.observability.metrics import record_request, track_generation
 from model_bridge.providers.contracts import (
+
     GenerationResult,
     Provider,
     PermanentProviderError,
@@ -74,7 +76,7 @@ class ChatService:
     backup_provider: Provider | None
     primary_breaker: CircuitBreaker
     backup_breaker: CircuitBreaker | None
-    chat_rate_limiter: SlidingWindowRateLimiter
+    chat_rate_limiter: TenantAdmissionLimiter
     generation_limiter: GenerationConcurrencyLimiter
     provider_name: str
     fallback_provider_name: str | None
@@ -85,7 +87,9 @@ class ChatService:
     generate: Callable[..., Awaitable[GenerationResult]] = llm_call
 
     # Applies routing, admission, idempotency, generation and final persistence.
-    async def handle(self, request: ChatCommand) -> ChatOutcome:
+    async def handle(
+        self, request: ChatCommand, *, input_body_bytes: int | None = None
+    ) -> ChatOutcome:
         started_at = time.perf_counter()
         tenant_limits = self.settings.effective_tenant_limits(
             request.tenant_id,
@@ -104,8 +108,30 @@ class ChatService:
             tenant=request.tenant_id,
             model_preference=model_preference,
         )
-        # limiter gate prevents user from overloading the app with requests
-        retry_after = self.chat_rate_limiter.try_acquire()
+        violation = validate_request_policy(
+            request,
+            self.settings.platform,
+            tenant_limits,
+            input_body_bytes=input_body_bytes,
+        )
+        if violation is not None:
+            return self._state_result(
+                request,
+                route,
+                "failed",
+                violation.detail,
+                422 if violation.kind == "invalid_request" else 413,
+                started_at,
+                error_type=violation.kind,
+            )
+        generation_budget = min(
+            self.deadline_seconds, tenant_limits.request_deadline_seconds
+        )
+        retry_after = self.chat_rate_limiter.try_acquire(
+            request.tenant_id,
+            limit=tenant_limits.rate_limit.requests,
+            window_seconds=tenant_limits.rate_limit.window_seconds,
+        )
         if retry_after is not None:
             response = self._state_result(
                 request=request,
@@ -124,7 +150,7 @@ class ChatService:
                 request.tenant_id,
                 request.request_id,
                 asdict(request),
-                self.deadline_seconds + 5,
+                generation_budget + self.settings.storage.lease_margin_seconds,
             )
         except IdempotencyConflictError as exc:
             # Return HTTP 409 because this request ID already represents different input.
@@ -216,7 +242,14 @@ class ChatService:
                     route=route,
                     tenant_id=request.tenant_id,
                     timeout_seconds=self.timeout_seconds,
-                    request_deadline_seconds=self.deadline_seconds,
+                    request_deadline_seconds=generation_budget,
+                    fallback_timeout_seconds=(
+                        self.settings.providers[
+                            self.fallback_provider_name
+                        ].attempt_timeout_seconds
+                        if self.fallback_provider_name
+                        else None
+                    ),
                     max_attempts=self.max_attempts,
                     retry_base_delay_seconds=self.retry_delay_seconds,
                 )
@@ -462,9 +495,12 @@ class ChatService:
             estimated_cost_usd=estimated_cost_usd,
             cache_hit=cache_hit,
             timed_out=timed_out,
-        )
+                )
         log_event(
             "request_finished",
+            level="error"
+            if status_code >= 500
+            else ("warning" if status == "unknown" or status_code >= 400 else "info"),
             request_id=request.request_id,
             provider=provider_name,
             model=model,
@@ -508,9 +544,13 @@ class ChatService:
             timed_out=timed_out,
             cache_hit=cache_hit,
         )
-        kind = {409: "conflict", 429: "rate_limited", 502: "provider_rejected"}.get(
-            status_code, status
-        )
+        kind = {
+            409: "conflict",
+            413: "input_too_large",
+            422: "invalid_request",
+            429: "rate_limited",
+            502: "provider_rejected",
+        }.get(status_code, status)
         return ChatOutcome(
             kind=kind,
             response=_state_response(request, status, route, detail, attempts),

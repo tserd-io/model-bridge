@@ -4,13 +4,65 @@ import asyncio
 import sqlite3
 import time
 from contextlib import closing
+from dataclasses import asdict
 from types import SimpleNamespace
 import pytest
+from model_bridge.api.responses import to_http_response
 from model_bridge.execution import generation
 from model_bridge.providers.contracts import GenerationResult
+from model_bridge.providers.contracts import PermanentProviderError, RetryableProviderError
 import model_bridge.storage.request_store as storage_module
 from model_bridge.application.outcomes import ChatCommand, ChatOutcome
 from model_bridge.execution.rate_limit import TenantRateLimiter
+
+
+def test_service_in_progress_response_preserves_retry_after(policy_service):
+    service = policy_service()
+    command = ChatCommand("pending-metadata", "test-tenant", "hello", "fast", 10)
+    claimed = service.request_store.claim(
+        command.tenant_id, command.request_id, asdict(command), 60
+    )
+    assert claimed.status == "claimed"
+
+    outcome = asyncio.run(service.handle(command))
+    assert outcome.kind == "in_progress"
+    assert outcome.retry_after == 1
+    response = to_http_response(outcome)
+    assert response.status_code == 202
+    assert response.headers["Retry-After"] == "1"
+    service.generate.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "failure, expected_kind, expected_error, expected_timeout",
+    [
+        (asyncio.TimeoutError(), "unknown", "timeout", True),
+        (
+            RetryableProviderError(
+                "deadline expired", attempts=0, failure_type="deadline_exceeded"
+            ),
+            "failed", "deadline_exceeded", True,
+        ),
+        (
+            PermanentProviderError("rejected", attempts=1),
+            "provider_rejected", "provider_rejection", False,
+        ),
+    ],
+)
+def test_service_preserves_error_and_timeout_metadata(
+    policy_service, failure, expected_kind, expected_error, expected_timeout
+):
+    service = policy_service()
+    service.generate.side_effect = failure
+    command = ChatCommand("error-metadata", "test-tenant", "hello", "fast", 10)
+
+    outcome = asyncio.run(service.handle(command))
+
+    assert outcome.kind == expected_kind
+    assert outcome.error_type == expected_error
+    assert outcome.timed_out is expected_timeout
+    assert outcome.retry_after is None
+    service.generate.assert_awaited_once()
 
 
 # Verifies direct service execution isolates tenants sharing an ID and replays saved results.

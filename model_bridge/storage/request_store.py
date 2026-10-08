@@ -2,6 +2,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,8 +26,13 @@ class RequestRecord:
 
 # Uses SQLite to claim request IDs, detect duplicates, track processing leases, and save outcomes.
 class RequestStore:
-    # Prepares the database directory, enables WAL journaling, and creates request storage if needed.
-    def __init__(self, database_path: str | Path) -> None:
+     # Prepares the database directory, enables WAL journaling, and creates request storage if needed.
+    def __init__(
+        self, database_path: str | Path, *, busy_timeout_seconds: float = 5
+    ) -> None:
+        if not math.isfinite(busy_timeout_seconds) or busy_timeout_seconds <= 0:
+            raise ValueError("SQLite busy timeout must be positive and finite")
+        self.busy_timeout_seconds = busy_timeout_seconds
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
@@ -55,16 +61,17 @@ class RequestStore:
         database_uri = self.database_path.resolve().as_uri() + "?mode=ro"
         connection = sqlite3.connect(database_uri, uri=True, timeout=1)
         try:
-            connection.execute(
-                "SELECT request_id FROM requests LIMIT 1"
-            ).fetchone()
+            connection.execute("SELECT request_id FROM requests LIMIT 1").fetchone()
         finally:
             # Release the connection even when the query fails.
             connection.close()
+
     # Yields a SQLite connection with named columns and closes it when the caller exits.
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection = sqlite3.connect(
+            self.database_path, timeout=self.busy_timeout_seconds
+        )
         connection.row_factory = sqlite3.Row
         try:
             yield connection

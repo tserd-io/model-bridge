@@ -9,9 +9,12 @@ OutcomeKind = Literal[
     "unknown",
     "conflict",
     "rate_limited",
+    "invalid_request",
+    "input_too_large",
     "provider_rejected",
     "failed",
 ]
+
 ResponseStatus = Literal["success", "in_progress", "unknown", "failed"]
 
 

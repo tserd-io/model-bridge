@@ -1,7 +1,8 @@
 # Model Bridge: Architecture and Behavior
 
-Last reviewed against source: 2026-10-06.
-Scope and Docker/CI documentation updated: 2026-10-06.
+Runtime hardening documentation updated: 2026-10-07, based on the confirmed
+deliverables in [HARDENING_PROPOSAL.md](./HARDENING_PROPOSAL.md).
+Project scope and earlier Docker/CI review: 2026-10-06.
 
 Model Bridge provides one API for calling LLM providers. It chooses models,
 limits work, saves request results, and measures response quality. This
@@ -48,15 +49,16 @@ caches, and local SQLite files are omitted from this map.
 ```text
 model-bridge/
 ├─ model_bridge/
-│  ├─ main.py                     # Builds the service and FastAPI app
+│  ├─ main.py                     # Builds the app and starts the configured server
 │  ├─ api/
 │  │  ├─ chat.py                  # Chat HTTP route
 │  │  ├─ health.py                # Liveness and readiness routes
 │  │  ├─ dependencies.py          # Supplies tenant identity and chat service
-│  │  ├─ schemas.py               # Checks request and response fields
+│  │  ├─ schemas.py               # Per-app field limits and UTF-8 validation
 │  │  └─ responses.py             # Turns service results into HTTP responses
 │  ├─ application/
 │  │  ├─ chat_service.py          # Coordinates the chat request
+│  │  ├─ request_policy.py        # HTTP-independent input and tenant policy checks
 │  │  └─ outcomes.py              # Request and result data classes
 │  ├─ providers/
 │  │  ├─ contracts.py             # Shared provider interface and errors
@@ -99,9 +101,10 @@ model-bridge/
 │  ├─ test_concurrency_limits.py   # Capacity limits and retries after rejection
 │  ├─ test_evaluation.py          # Evaluation summaries and files
 │  ├─ test_gateway.py             # Routing, retries and stored results
-│  ├─ test_generation_circuit.py  # Breaker checks around provider calls
+│  ├─ test_generation_circuit.py  # Breakers, deadlines and provider timeouts
 │  ├─ test_health.py              # Liveness and database readiness
-│  ├─ test_input_limits.py        # Message length and HTTP body limits
+│  ├─ test_input_limits.py        # Tenant/platform input, token and Unicode limits
+│  ├─ test_runtime_settings.py    # Logging, leases, app settings and shutdown
 │  └─ test_tenant_concurrency.py  # Tenant identity and capacity limits
 ├─ requirements.txt              # Application dependencies
 ├─ requirements-dev.txt          # Development tools and application dependencies
@@ -126,6 +129,16 @@ and identity, then passes a request to the service. The service chooses a
 model, applies limits, calls providers, and saves the result. It returns
 plain data; `api/responses.py` adds the HTTP status and headers.
 
+[request_policy.py](./model_bridge/application/request_policy.py) performs
+deterministic input checks without HTTP, database, or provider dependencies.
+The service applies these checks even for callers that bypass HTTP. The HTTP
+adapter measures body bytes and passes that count separately to the service;
+transport metadata does not enter the request command or its replay hash.
+
+HTTP schemas are built from each application's settings. When an existing
+service is injected, the app derives settings from it; explicitly supplying
+different settings is rejected rather than mixing validation and runtime policy.
+
 Providers share an asynchronous `complete()` interface that returns a
 `GenerationResult`. Each adapter translates its provider's responses and
 errors into these shared types:
@@ -143,12 +156,16 @@ the settings file does not determine who is allowed to access the API.
 
 ## What happens to a chat request
 
-1. **Check input and identity.** Enforce request-body and message-length
-   limits. Use the trusted tenant identity instead of the body's tenant ID.
+1. **Check input and identity.** Validate HTTP fields and UTF-8 using the app's
+   configured limits. Use the trusted tenant identity instead of the body's
+   tenant ID.
 2. **Choose a model.** Simple tasks use `fast`; complex and high-risk tasks
-   use `balanced`. Otherwise, use the requested model preference.
-3. **Check the rate limit.** Too many requests receive HTTP 429 with
-   `Retry-After`, before database or provider work.
+   use `balanced`. Otherwise, use the requested model preference. The service
+   checks effective token, message, and input-byte limits before admission or
+   storage, including for direct callers. Oversized tokens are rejected, not clamped.
+3. **Check the rate limit.** Admit against tenant and platform quotas atomically.
+   Too many requests receive HTTP 429 with `Retry-After`, before database or
+   provider work; rejection spends neither quota.
 4. **Check stored requests.** Look up `(tenant_id, request_id)` and compare
    the validated input. Return a saved result, existing state, or conflict
    when appropriate.
@@ -187,18 +204,25 @@ process. Multiple workers or replicas have separate limits and state.
 These limits reduce memory pressure; they do not set a hard tenant memory
 budget or limit the amount of data retained in SQLite.
 
-Some settings are validated but not yet used:
+Runtime settings now control the following behavior:
 
 | Setting | Current behavior |
 |---|---|
 | Tenant and platform concurrency | Enforced during generation. |
-| Platform body bytes and message length | Enforced before generation. |
-| Platform deadline and rate limit | Applied by the chat service. |
-| Tenant body bytes, output tokens, deadline, and rate limit | Validated, but not enforced by the chat service. |
-| Platform output-token limit | The request schema uses a fixed maximum of 8192. |
+| Tenant and platform input bytes | Actual HTTP body bytes and normalized caller-input bytes are checked independently; oversize returns 413. Trusted identity is excluded from normalized input. |
+| Platform message length and tenant/platform output tokens | Per-app HTTP schemas and independent service checks enforce effective ceilings; invalid input returns 422. |
+| Tenant and platform deadlines | Generation uses the effective tenant budget bounded by the platform deadline; this does not bound the whole HTTP request or storage work. |
+| Tenant and platform rate limits | One admission decision checks and spends both quotas, each with its own window. |
 | Metrics enabled and tenant labels | Applied; tenant labels are limited to an allowlist. |
-| Logging switches and shutdown grace | Not connected to runtime behavior. |
-| Storage busy timeout and lease margin | Still use fixed five-second values. |
+| Logging enabled and minimum level | Applied to the process-wide application logger. |
+| Shutdown grace | Passed to the one-worker server by the configured module entry point. Real Linux signal behavior still awaits verification. |
+| Storage busy timeout and lease margin | Write connections use the configured timeout; claims use the effective generation budget plus the configured margin. |
+
+Admitted requests spend rate quota even when they later replay a saved response,
+conflict with an existing request, or fail at the provider. Expired tenant
+histories are cleaned under the admission lock on the next admission, not by a
+background worker. Changing a tenant's rate policy while its history is active
+is rejected; settings are startup configuration, not a hot-reload mechanism.
 
 ## Stored requests and duplicate handling
 
@@ -208,6 +232,7 @@ the same request ID without a collision. Within one tenant:
 - Repeating a successful request with the same validated input returns its
   saved response, with `cache_hit=true` and `X-Idempotent-Replay: true`.
 - Reusing that ID with different input returns HTTP 409.
+- A matching request still in progress returns HTTP 202 with `Retry-After: 1`.
 - Capacity rejection saves a `retryable` state that a matching request can
   claim again.
 - `unknown` means the provider may have completed the work. Repeating the
@@ -216,9 +241,14 @@ the same request ID without a collision. Within one tenant:
 This duplicate handling is called **idempotency**. It does not guarantee
 that an external provider runs each request exactly once.
 
+Service outcomes retain retry timing, error classification, and timeout flags
+for direct callers as well as HTTP response conversion. Regression tests cover
+service-produced in-progress responses and error/timeout metadata.
+
 SQLite transactions coordinate request claims. Each running request has a
-time limit for recording its result, called a processing lease. If that
-lease expires, the request becomes `unknown` when checked again.
+time limit for recording its result, called a processing lease. It is derived
+from the tenant's effective generation budget plus the configured lease margin.
+If that lease expires, the request becomes `unknown` when checked again.
 
 Startup creates missing databases and tables. Existing incompatible tables
 are neither migrated nor rejected at startup. The reference implementation
@@ -233,6 +263,17 @@ the current scope, rather than required follow-up work.
 Generation separates temporary failures, definite rejections, and uncertain
 results. A timeout does not prove that remote work stopped; retrying or
 falling back after an uncertain result can duplicate that work.
+
+Generation creates one monotonic deadline at its start. Primary attempts,
+retry delays, and fallback share that deadline and the primary retry settings;
+fallback does not get a new attempt budget. Each attempt uses the active
+provider's own timeout, capped by the remaining generation time. The gateway
+also wraps the call in a timeout so adapters cannot bypass it merely by ignoring
+their timeout argument. Cancellation still requires a cooperative async adapter.
+
+Remaining time is checked again after breaker admission and synchronous logging.
+Expiry before a provider call releases the unused probe without recording a
+provider attempt, while preserving earlier attempts and any uncertain outcome.
 
 The default primary and fallback both use the same Ollama host and model
 mapping. A fallback that can survive that backend failing needs a different
@@ -268,6 +309,13 @@ timestamps to the millisecond, request IDs, routes, attempts, outcomes, and
 latency. Request and provider-call events include tenant identity. Logs omit
 prompt and response content.
 
+Application composition applies logging enablement and minimum severity.
+Events use explicit severity levels and operational metadata, excluding
+credentials and exception text as well as prompt/generated content. The logging
+helper is not a general-purpose redactor: callers must supply permitted fields.
+This logger is process-wide, so multiple apps in one process cannot maintain
+independent logging policies. Uvicorn's own logging is configured separately.
+
 When enabled, `/metrics/` reports requests, errors, retries, fallback,
 latency, saved-response reuse, available token usage, and estimated cost.
 `llm_active_generations` counts jobs holding generation capacity in the
@@ -290,6 +338,7 @@ they are not a complete record of all remote work or charges.
 | `GET /health/ready` | The existing SQLite requests table can be read. |
 
 Readiness opens SQLite read-only and does not create a missing database.
+Its read timeout remains one second, independent of the configured write timeout.
 It does not check the full table structure, database writes, or provider
 availability. An incompatible table can pass readiness while chat fails.
 This is a basic demonstration health check, not a database durability or
@@ -330,6 +379,13 @@ outside scope.
 Tests in `tests/` cover routing, retries, fallback, stored responses, tenant
 keys, circuit breakers, rate and concurrency limits, input limits, health,
 HTTP responses, and evaluation summaries. The source map identifies each file.
+
+Hardening regressions additionally cover custom app limits, direct-service
+policy checks, normalized versus HTTP input bytes, invalid Unicode, atomic rate
+admission, deadline expiry before provider work, fallback-specific timeouts,
+logging settings, processing leases, and service-produced outcome metadata.
+Startup wiring is tested separately from real signal handling; two real SIGTERM
+shutdown tests require Linux and skip on Windows.
 
 They use fake providers, controlled clocks, mocks, and temporary databases.
 `conftest.py` supplies a default test identity; identity-specific tests replace
@@ -378,6 +434,11 @@ It reports logs and container state on failure and removes the container on
 completion. The Dockerfile uses a non-root user, writable `/data`, and one
 Uvicorn worker. It currently installs the CI lock, including development tools.
 
+The image starts with `python -m model_bridge.main`. This entry point passes
+configured graceful-shutdown seconds to Uvicorn and avoids constructing the app
+twice. The importable `model_bridge.main:app` remains available, but launching it
+directly with Uvicorn requires configuring Uvicorn's shutdown grace separately.
+
 Fallback is disabled and no OpenAI credential is supplied. Installation and
 auditing need network access; the socket restriction applies only to pytest.
 Lint failures fail the job rather than producing advisory warnings.
@@ -386,7 +447,16 @@ Dependency files live at the repository root. Windows development uses
 `python -m pip install -r requirements-dev.txt`. The CI lock targets Linux
 Python 3.12 and contains `uvloop`, which cannot be installed on Windows.
 
-On 2026-10-06, local checks passed Ruff and **86 tests**, including four new
+The 2026-10-07 hardening review records **199 passed, 2 skipped** in the full
+Windows suite before four new outcome-metadata cases were added. The subsequent
+focused service/HTTP run passed **19 tests**, including all four additions; the
+full suite was not rerun for that addition. Ruff, fake-provider smoke checks,
+and isolated real Uvicorn startup also passed. These results do not verify a
+Docker image or the two Linux-only shutdown tests. See
+[the hardening verification record](./HARDENING_PROPOSAL.md#current-verification)
+for the distinction between current and historical runs.
+
+Earlier, on 2026-10-06, local checks passed Ruff and **86 tests**, including four new
 circuit cases covering retryable storage, recovery with the same request ID,
 preserved uncertainty, and provider-specific breaker settings. These checks
 used fake providers and temporary storage; no application code changed in
@@ -424,7 +494,8 @@ than complete the current Docker work.
 
 ## Remaining work and future direction
 
-- Apply the remaining tenant policies and unused configuration switches.
+- Complete Linux shutdown and container verification for the implemented
+  hardening changes; Windows checks do not establish these results.
 - Preserve demonstrated tenant separation and duplicate handling when changing
   existing features; this does not require a production identity system.
 - Review model pricing; cost estimates are incomplete and need updating.
