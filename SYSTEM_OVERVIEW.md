@@ -3,6 +3,7 @@
 Runtime hardening documentation updated: 2026-10-07, based on the confirmed
 deliverables in [HARDENING_PROPOSAL.md](./HARDENING_PROPOSAL.md).
 Project scope and earlier Docker/CI review: 2026-10-06.
+Test organization updated: 2026-10-19; see [the testing guide](./tests/README.md).
 
 Model Bridge provides one API for calling LLM providers. It chooses models,
 limits work, saves request results, and measures response quality. This
@@ -91,21 +92,16 @@ model-bridge/
 │     └─ datasets/
 │        └─ golden_dataset.json
 ├─ tests/
-│  ├─ conftest.py                 # Shared test setup and temporary services
-│  ├─ testing_app.py              # Test app with fake provider and identity
-│  ├─ check_startup.py            # Starts and checks a Uvicorn server
-│  ├─ smoke_test.py               # Manual local checks; --live opts into a provider call
-│  ├─ test_chat_responses.py      # Response codes, data and headers
-│  ├─ test_chat_service.py        # Service calls and saved results per tenant
-│  ├─ test_circuit_breaker.py      # Breaker states, API retryability and provider settings
-│  ├─ test_concurrency_limits.py   # Capacity limits and retries after rejection
-│  ├─ test_evaluation.py          # Evaluation summaries and files
-│  ├─ test_gateway.py             # Routing, retries and stored results
-│  ├─ test_generation_circuit.py  # Breakers, deadlines and provider timeouts
-│  ├─ test_health.py              # Liveness and database readiness
-│  ├─ test_input_limits.py        # Tenant/platform input, token and Unicode limits
-│  ├─ test_runtime_settings.py    # Logging, leases, app settings and shutdown
-│  └─ test_tenant_concurrency.py  # Tenant identity and capacity limits
+│  ├─ acceptance/              # Main API behavior scenarios
+│  ├─ focused/                 # Detailed regression and boundary cases
+│  ├─ unit/                    # Calculations, responses and provider adapters
+│  ├─ e2e/                     # Real server startup and Linux shutdown
+│  ├─ support/                 # Scripted providers and fresh-app harness
+│  ├─ conftest.py              # Explicit fixtures and collection isolation
+│  ├─ testing_app.py           # Subprocess test app with controlled identity
+│  ├─ check_startup.py         # Real Uvicorn startup helper
+│  ├─ smoke_test.py            # Compatibility runner; optional --live call
+│  └─ README.md                # Test commands and design guide
 ├─ requirements.txt              # Application dependencies
 ├─ requirements-dev.txt          # Development tools and application dependencies
 ├─ requirements-ci.lock          # Exact versions and download hashes for CI
@@ -376,42 +372,41 @@ outside scope.
 
 ## Tests and manual checks
 
-Tests in `tests/` cover routing, retries, fallback, stored responses, tenant
-keys, circuit breakers, rate and concurrency limits, input limits, health,
-HTTP responses, and evaluation summaries. The source map identifies each file.
-
-Hardening regressions additionally cover custom app limits, direct-service
-policy checks, normalized versus HTTP input bytes, invalid Unicode, atomic rate
-admission, deadline expiry before provider work, fallback-specific timeouts,
-logging settings, processing leases, and service-produced outcome metadata.
-Startup wiring is tested separately from real signal handling; two real SIGTERM
-shutdown tests require Linux and skip on Windows.
-
-They use fake providers, controlled clocks, mocks, and temporary databases.
-`conftest.py` supplies a default test identity; identity-specific tests replace
-it. Importing the application still constructs its configured providers and
-store, so use fake-provider settings and a temporary `IDEMPOTENCY_DB_PATH`
-before importing it for isolated checks.
+The main acceptance suite sends HTTP requests through the real application,
+including routing, admission, generation, storage, logs and metrics. Scripted
+providers control responses and failures at the external boundary; test-only
+identity overrides supply tenants. Each harness creates a fresh app and temporary
+SQLite store. See [tests/README.md](./tests/README.md) for the scenario map.
 
 Run from the repository root:
 
 ```sh
-python -m pytest tests
-python -m tests.smoke_test
-python -m tests.check_startup
+python -m pytest tests/acceptance -q
+python -m pytest -q
 ```
 
-The smoke runner checks provider adapters, request-tracing headers, retries,
-timeouts, deadlines, and duplicate handling. Its `smoke_*` functions are not
-run by pytest. It uses simulated providers by default; `--live` also calls
-the configured primary provider with fallback disabled.
+Focused tests preserve detailed regressions for clocks, deadlines, cancellation,
+Unicode, settings, and tenant policy. Unit tests cover calculations, summaries,
+HTTP response conversion, and provider adapters. End-to-end tests launch real
+server processes: startup checks health and chat, while two SIGTERM shutdown
+cases require Linux and skip on Windows. In-process acceptance tests do not
+establish real network or process behavior.
 
-The startup check starts a real Uvicorn server with a fake provider, temporary
-storage, and test identity. It checks both health endpoints and chat, then
-stops the server.
+Fixtures are explicit rather than autouse. Pure unit tests need no per-test app
+or database. Importing the production main module still creates its global app;
+conftest sets fake-provider and disposable-storage environment values before
+collection imports, and restores process logging around app fixtures.
 
-These checks cover selected behavior, not real-model quality, production
-capacity, every provider failure, or complete tenant isolation.
+`python -m tests.smoke_test` delegates to acceptance and provider-adapter tests.
+Its optional `--live` flag then calls the configured primary provider with fallback
+disabled. No real-provider call is part of normal pytest execution.
+`python -m tests.check_startup` remains a standalone command; the e2e suite also
+runs that helper, so CI needs no duplicate startup step.
+
+Local validation on 2026-10-19: **216 passed, 2 skipped** on Windows, including
+real Uvicorn startup; Ruff passed. The skips are Linux shutdown cases. Hosted CI,
+Docker, live providers and Linux socket restrictions were not rerun in this change.
+These checks do not establish real-model quality or production capacity.
 
 ## Continuous integration
 
@@ -425,8 +420,9 @@ Docker smoke job can run independently.
 | Install dependencies | Install exact versions from `requirements-ci.lock`, verify download hashes, and run `pip check`. |
 | Ruff lint | Check `model_bridge` and `tests` for syntax errors, undefined names, unused imports, and related issues using `.github/workflows/ruff.toml`. |
 | Security audit | Run `pip-audit --require-hashes --strict` on the lock in a separate environment. The audit tool itself is unpinned. |
-| Tests | Use fake providers and temporary storage. Block network sockets; allow Unix sockets. |
-| Startup | Run `python -m tests.check_startup` against a local server. |
+| Acceptance | Run the main API scenarios with fake providers; block network sockets and allow Unix sockets. |
+| Focused and unit | Run detailed regressions and component tests under the same socket restrictions. |
+| Real server | Run `tests/e2e` with loopback networking for startup and Linux shutdown checks. |
 
 The separate `docker-smoke` job builds the image, starts it with a fake
 provider and no fallback, and waits for its Docker readiness health check.
@@ -440,7 +436,7 @@ twice. The importable `model_bridge.main:app` remains available, but launching i
 directly with Uvicorn requires configuring Uvicorn's shutdown grace separately.
 
 Fallback is disabled and no OpenAI credential is supplied. Installation and
-auditing need network access; the socket restriction applies only to pytest.
+auditing need network access; socket restrictions apply to acceptance, focused and unit tests; real-server tests need loopback networking.
 Lint failures fail the job rather than producing advisory warnings.
 
 Dependency files live at the repository root. Windows development uses

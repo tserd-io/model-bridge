@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 # Creates isolated request storage and a client while forbidding model calls from health probes.
 @pytest.fixture
-def health_app(monkeypatch, tmp_path):
+def health_app(test_app, monkeypatch, tmp_path):
     database_path = tmp_path / "requests.sqlite3"
     monkeypatch.setenv("LLM_PROVIDER", "fake")
     monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "")
@@ -18,20 +18,20 @@ def health_app(monkeypatch, tmp_path):
     from model_bridge.storage.request_store import RequestStore
 
     monkeypatch.setattr(
-        main.app.state.chat_service, "request_store", RequestStore(database_path)
+        test_app.state.chat_service, "request_store", RequestStore(database_path)
     )
 
     # Fails immediately if a health probe attempts generation.
     async def unexpected_model_call(*args, **kwargs):
         pytest.fail("Health probes must not call a model")
 
-    monkeypatch.setattr(main.app.state.chat_service, "generate", unexpected_model_call)
-    with TestClient(main.app) as client:
+    monkeypatch.setattr(test_app.state.chat_service, "generate", unexpected_model_call)
+    with TestClient(test_app) as client:
         yield main, client
 
 
 # Checks that liveness responds successfully without accessing the database.
-def test_liveness_does_not_access_database(health_app, monkeypatch):
+def test_liveness_does_not_access_database(test_app, health_app, monkeypatch):
     main, client = health_app
 
     # Fails immediately if liveness attempts to inspect the database.
@@ -39,7 +39,7 @@ def test_liveness_does_not_access_database(health_app, monkeypatch):
         pytest.fail("Liveness must not depend on database availability")
 
     monkeypatch.setattr(
-        main.app.state.chat_service.request_store,
+        test_app.state.chat_service.request_store,
         "check_readable",
         unexpected_database_check,
     )
@@ -59,7 +59,7 @@ def test_readiness_with_healthy_database(health_app):
 # Checks HTTP 503 for missing, corrupt, or schema-less databases while liveness remains available.
 @pytest.mark.parametrize("database_state", ["missing", "corrupt", "missing_schema"])
 def test_readiness_with_unavailable_database(
-    health_app, monkeypatch, tmp_path, database_state
+    test_app, health_app, monkeypatch, tmp_path, database_state
 ):
     main, client = health_app
     database_path = tmp_path / "unavailable.sqlite3"
@@ -69,7 +69,7 @@ def test_readiness_with_unavailable_database(
         sqlite3.connect(database_path).close()
 
     monkeypatch.setattr(
-        main.app.state.chat_service.request_store,
+        test_app.state.chat_service.request_store,
         "database_path",
         database_path,
     )
@@ -82,17 +82,19 @@ def test_readiness_with_unavailable_database(
 
 
 # Checks that readiness recovers after database access is restored.
-def test_readiness_recovers_after_database_returns(health_app, monkeypatch, tmp_path):
+def test_readiness_recovers_after_database_returns(
+    test_app, health_app, monkeypatch, tmp_path
+):
     main, client = health_app
-    healthy_path = main.app.state.chat_service.request_store.database_path
+    healthy_path = test_app.state.chat_service.request_store.database_path
     monkeypatch.setattr(
-        main.app.state.chat_service.request_store,
+        test_app.state.chat_service.request_store,
         "database_path",
         tmp_path / "missing.sqlite3",
     )
     assert client.get("/health/ready").status_code == 503
     monkeypatch.setattr(
-        main.app.state.chat_service.request_store,
+        test_app.state.chat_service.request_store,
         "database_path",
         healthy_path,
     )
@@ -100,16 +102,17 @@ def test_readiness_recovers_after_database_returns(health_app, monkeypatch, tmp_
 
 
 # Checks a long normal-storage timeout does not make readiness wait for that full period.
-def test_readiness_timeout_is_independent_of_storage_busy_timeout(policy_service):
+def test_readiness_timeout_is_independent_of_storage_busy_timeout(
+    test_app, policy_service
+):
     service = policy_service(storage={"busy_timeout_seconds": 30})
-    from model_bridge import main
 
     blocker = sqlite3.connect(service.request_store.database_path)
     try:
         # DELETE journaling and an exclusive lock block readers, unlike an ordinary WAL writer.
         blocker.execute("PRAGMA journal_mode=DELETE")
         blocker.execute("BEGIN EXCLUSIVE")
-        with TestClient(main.app) as client:
+        with TestClient(test_app) as client:
             started = time.monotonic()
             response = client.get("/health/ready")
             elapsed = time.monotonic() - started

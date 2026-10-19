@@ -10,7 +10,10 @@ import pytest
 from model_bridge.api.responses import to_http_response
 from model_bridge.execution import generation
 from model_bridge.providers.contracts import GenerationResult
-from model_bridge.providers.contracts import PermanentProviderError, RetryableProviderError
+from model_bridge.providers.contracts import (
+    PermanentProviderError,
+    RetryableProviderError,
+)
 import model_bridge.storage.request_store as storage_module
 from model_bridge.application.outcomes import ChatCommand, ChatOutcome
 from model_bridge.execution.rate_limit import TenantRateLimiter
@@ -41,11 +44,15 @@ def test_service_in_progress_response_preserves_retry_after(policy_service):
             RetryableProviderError(
                 "deadline expired", attempts=0, failure_type="deadline_exceeded"
             ),
-            "failed", "deadline_exceeded", True,
+            "failed",
+            "deadline_exceeded",
+            True,
         ),
         (
             PermanentProviderError("rejected", attempts=1),
-            "provider_rejected", "provider_rejection", False,
+            "provider_rejected",
+            "provider_rejection",
+            False,
         ),
     ],
 )

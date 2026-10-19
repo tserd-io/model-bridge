@@ -14,7 +14,9 @@ def test_unpriced_model_cost_remains_unknown(model):
     assert estimate_cost_usd(model, 1000, 100) is None
 
 
-@pytest.mark.parametrize("input_tokens,output_tokens", [(None, 100), (1000, None), (None, None)])
+@pytest.mark.parametrize(
+    "input_tokens,output_tokens", [(None, 100), (1000, None), (None, None)]
+)
 def test_missing_usage_remains_unknown(input_tokens, output_tokens):
     assert estimate_cost_usd("gpt-5.5", input_tokens, output_tokens) is None
 

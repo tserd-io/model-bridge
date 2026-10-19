@@ -19,12 +19,31 @@ def test_summary_preserves_metrics_and_cost_coverage(second_cost):
             "field_metrics": field_metrics,
             "cache_hit": cache_hit,
         }
-        for status, http_status, latency, input_tokens, output_tokens, cost,
-        passed, exact_match, field_metrics, cache_hit in [
-            ("success", 200, 10, 100, 20, 0.01, True, True,
-             {"precision": 1.0, "recall": 1.0, "f1": 1.0}, False),
-            ("success", 200, 30, 50, 10, second_cost, False, False,
-             {"precision": 0.0, "recall": 0.0, "f1": 0.0}, True),
+        for status, http_status, latency, input_tokens, output_tokens, cost, passed, exact_match, field_metrics, cache_hit in [
+            (
+                "success",
+                200,
+                10,
+                100,
+                20,
+                0.01,
+                True,
+                True,
+                {"precision": 1.0, "recall": 1.0, "f1": 1.0},
+                False,
+            ),
+            (
+                "success",
+                200,
+                30,
+                50,
+                10,
+                second_cost,
+                False,
+                False,
+                {"precision": 0.0, "recall": 0.0, "f1": 0.0},
+                True,
+            ),
             ("failed", 503, 50, None, None, None, False, None, None, False),
             ("unknown", 202, None, None, None, None, False, None, None, False),
         ]

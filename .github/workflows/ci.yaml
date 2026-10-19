@@ -46,13 +46,18 @@ jobs:
             --strict \
             -r requirements-ci.lock
 
-      - name: Run isolated tests
+      - name: "Tests: acceptance scenarios"
+        run: |
+          python -m pytest tests/acceptance -q \
+            --disable-socket --allow-unix-socket
+
+      - name: "Tests: focused regressions"
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/model-bridge"
           export IDEMPOTENCY_DB_PATH="$RUNNER_TEMP/model-bridge/requests.sqlite3"
 
-          python -m pytest tests \
+          python -m pytest tests/focused \
             -o addopts= \
             -q \
             -p no:cacheprovider \
@@ -60,8 +65,16 @@ jobs:
             --disable-socket \
             --allow-unix-socket
 
-      - name: Check Uvicorn startup
-        run: python -m tests.check_startup
+      - name: "Tests: unit contracts"
+        run: |
+          python -m pytest tests/unit -q \
+            --disable-socket --allow-unix-socket
+
+      - name: "Tests: real server startup and HTTP"
+        run: python -m pytest tests/e2e/test_server.py -v
+
+      - name: "Tests: Linux graceful shutdown"
+        run: python -m pytest tests/e2e/test_shutdown.py -v
   docker-smoke:
     name: Docker build and startup
     runs-on: ubuntu-24.04

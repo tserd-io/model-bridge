@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from model_bridge import main
 from model_bridge.providers.contracts import GenerationResult
 from model_bridge.providers.contracts import PermanentProviderError
 from model_bridge.execution.rate_limit import TenantRateLimiter
@@ -121,16 +120,16 @@ def test_simultaneous_generation_admission_is_bounded():
 
 # Isolates API storage and admission rate while leaving generation capacity under test.
 @pytest.fixture
-def concurrency_app(monkeypatch, tmp_path):
+def concurrency_app(test_app, monkeypatch, tmp_path):
     monkeypatch.setattr(
-        main.app.state.chat_service,
+        test_app.state.chat_service,
         "request_store",
         RequestStore(tmp_path / "requests.sqlite3"),
     )
     monkeypatch.setattr(
-        main.app.state.chat_service, "chat_rate_limiter", TenantRateLimiter(100, 60)
+        test_app.state.chat_service, "chat_rate_limiter", TenantRateLimiter(100, 60)
     )
-    return main
+    return test_app
 
 
 # Returns a valid payload with a distinct idempotency identity for each job.
@@ -150,16 +149,16 @@ def test_api_capacity_rejection_preserves_retryable_identity(
     limiter_class, _ = limiter_types()
     limiter = limiter_class(1)
     monkeypatch.setattr(
-        concurrency_app.app.state.chat_service,
+        concurrency_app.state.chat_service,
         "generation_limiter",
         limiter,
         raising=False,
     )
     generation = AsyncMock(return_value=GenerationResult("ok", "fake-fast", attempts=1))
-    monkeypatch.setattr(concurrency_app.app.state.chat_service, "generate", generation)
+    monkeypatch.setattr(concurrency_app.state.chat_service, "generate", generation)
 
     async def scenario():
-        transport = httpx.ASGITransport(app=concurrency_app.app)
+        transport = httpx.ASGITransport(app=concurrency_app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
@@ -181,16 +180,16 @@ def test_cached_replay_is_available_at_full_capacity(concurrency_app, monkeypatc
     limiter_class, _ = limiter_types()
     limiter = limiter_class(1)
     monkeypatch.setattr(
-        concurrency_app.app.state.chat_service,
+        concurrency_app.state.chat_service,
         "generation_limiter",
         limiter,
         raising=False,
     )
     generation = AsyncMock(return_value=GenerationResult("ok", "fake-fast", attempts=1))
-    monkeypatch.setattr(concurrency_app.app.state.chat_service, "generate", generation)
+    monkeypatch.setattr(concurrency_app.state.chat_service, "generate", generation)
 
     async def scenario():
-        transport = httpx.ASGITransport(app=concurrency_app.app)
+        transport = httpx.ASGITransport(app=concurrency_app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
@@ -211,7 +210,7 @@ def test_api_provider_failure_releases_capacity(concurrency_app, monkeypatch):
     limiter_class, rejected = limiter_types()
     limiter = limiter_class(1)
     monkeypatch.setattr(
-        concurrency_app.app.state.chat_service,
+        concurrency_app.state.chat_service,
         "generation_limiter",
         limiter,
         raising=False,
@@ -223,12 +222,10 @@ def test_api_provider_failure_releases_capacity(concurrency_app, monkeypatch):
                 pytest.fail("API did not acquire generation capacity")
         raise PermanentProviderError("simulated rejection", attempts=1)
 
-    monkeypatch.setattr(
-        concurrency_app.app.state.chat_service, "generate", fail_generation
-    )
+    monkeypatch.setattr(concurrency_app.state.chat_service, "generate", fail_generation)
 
     async def scenario():
-        transport = httpx.ASGITransport(app=concurrency_app.app)
+        transport = httpx.ASGITransport(app=concurrency_app)
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:

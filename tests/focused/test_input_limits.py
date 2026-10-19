@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fastapi.testclient import TestClient
 
-from model_bridge import main
 from model_bridge.providers.contracts import GenerationResult
 from model_bridge.config.loader import PLATFORM_SETTINGS
 from model_bridge.execution.rate_limit import TenantRateLimiter
@@ -18,13 +17,13 @@ from model_bridge.api.dependencies import AuthenticatedTenant, get_authenticated
 
 # Gives input tests temporary storage and generation that never contacts a provider.
 @pytest.fixture
-def input_app(monkeypatch, tmp_path):
+def input_app(test_app, monkeypatch, tmp_path):
     store = RequestStore(tmp_path / "requests.sqlite3")
     claim = Mock(wraps=store.claim)
     monkeypatch.setattr(store, "claim", claim)
-    monkeypatch.setattr(main.app.state.chat_service, "request_store", store)
+    monkeypatch.setattr(test_app.state.chat_service, "request_store", store)
     monkeypatch.setattr(
-        main.app.state.chat_service,
+        test_app.state.chat_service,
         "chat_rate_limiter",
         TenantRateLimiter(100, 60),
     )
@@ -36,8 +35,8 @@ def input_app(monkeypatch, tmp_path):
             attempts=1,
         )
     )
-    monkeypatch.setattr(main.app.state.chat_service, "generate", generation)
-    return main.app, generation, claim
+    monkeypatch.setattr(test_app.state.chat_service, "generate", generation)
+    return test_app, generation, claim
 
 
 # Supplies a valid chat payload while allowing each test to control message size.
@@ -189,13 +188,13 @@ def normalized_bytes(data):
 # Checks the tenant's token boundary through HTTP and direct service calls before claims.
 @pytest.mark.parametrize("tokens", [2047, 2048, 2049])
 @pytest.mark.parametrize("entry_point", ["http", "service"])
-def test_tenant_token_boundary(policy_service, tokens, entry_point):
+def test_tenant_token_boundary(test_app, policy_service, tokens, entry_point):
     service = policy_service(tenant={"max_output_tokens": 2048})
     claim = Mock(wraps=service.request_store.claim)
     service.request_store.claim = claim
     data = {**payload(), "max_tokens": tokens}
     if entry_point == "http":
-        with TestClient(main.app) as client:
+        with TestClient(test_app) as client:
             response = client.post("/chat", json=data)
         accepted = response.status_code == 200
         if tokens > 2048:
@@ -221,7 +220,7 @@ def test_tenant_token_boundary(policy_service, tokens, entry_point):
 @pytest.mark.parametrize("length_header", ["absent", "accurate", "understated"])
 @pytest.mark.parametrize("extra", [0, 1])
 def test_tenant_body_byte_boundary(
-    policy_service, message, chunked, length_header, extra
+    test_app, policy_service, message, chunked, length_header, extra
 ):
     service = policy_service(tenant={"max_input_bytes": 512})
     claim = Mock(wraps=service.request_store.claim)
@@ -233,7 +232,7 @@ def test_tenant_body_byte_boundary(
         length = len(body) if length_header == "accurate" else 1
         headers.append((b"content-length", str(length).encode("ascii")))
     chunks = [body[:256], body[256:]] if chunked else [body]
-    status = asyncio.run(send_body(main.app, chunks, headers))
+    status = asyncio.run(send_body(test_app, chunks, headers))
     assert status == (200 if extra == 0 else 413)
     if extra:
         claim.assert_not_called()
@@ -245,7 +244,7 @@ def test_tenant_body_byte_boundary(
 # Checks the shared normalized-size boundary, including multibyte caller input.
 @pytest.mark.parametrize("entry_point", ["http", "service"])
 @pytest.mark.parametrize("extra", [0, 1])
-def test_normalized_input_boundary(policy_service, entry_point, extra):
+def test_normalized_input_boundary(test_app, policy_service, entry_point, extra):
     data = payload("é" * 100)
     limit = len(normalized_bytes(data)) - extra
     service = policy_service(tenant={"max_input_bytes": limit})
@@ -257,7 +256,7 @@ def test_normalized_input_boundary(policy_service, entry_point, extra):
             "utf-8"
         )
         assert len(body) <= limit
-        with TestClient(main.app) as client:
+        with TestClient(test_app) as client:
             result = client.post(
                 "/chat", content=body, headers={"Content-Type": "application/json"}
             )
@@ -275,7 +274,7 @@ def test_normalized_input_boundary(policy_service, entry_point, extra):
 
 
 # Checks tenant-specific body allowances without changing the trusted identity boundary.
-def test_tenant_body_allowances_are_independent(policy_service, monkeypatch):
+def test_tenant_body_allowances_are_independent(test_app, policy_service, monkeypatch):
     service = policy_service(
         tenant={"max_input_bytes": 512},
         overrides={"tenant-b": {"max_input_bytes": 1024}},
@@ -287,10 +286,10 @@ def test_tenant_body_allowances_are_independent(policy_service, monkeypatch):
         return AuthenticatedTenant(id=current[0])
 
     monkeypatch.setitem(
-        main.app.dependency_overrides, get_authenticated_tenant, identity
+        test_app.dependency_overrides, get_authenticated_tenant, identity
     )
     body = body_with_size(768)
-    with TestClient(main.app) as client:
+    with TestClient(test_app) as client:
         rejected = client.post(
             "/chat", content=body, headers={"Content-Type": "application/json"}
         )
@@ -305,10 +304,10 @@ def test_tenant_body_allowances_are_independent(policy_service, monkeypatch):
 
 # Checks transport formatting and trusted identity length do not change normalized size.
 def test_input_formatting_replays_without_size_metadata_in_hash(
-    policy_service, monkeypatch
+    test_app, policy_service, monkeypatch
 ):
     service = policy_service(tenant={"max_input_bytes": 512})
-    with TestClient(main.app) as client:
+    with TestClient(test_app) as client:
         first = client.post("/chat", json=payload())
         body = json.dumps(payload(), indent=2).encode() + b" " * 20
         replay = client.post(
@@ -354,9 +353,9 @@ def test_all_caller_fields_count_toward_normalized_size(policy_service, field, v
 
 
 # Checks omitted and explicit null task types produce the same request identity.
-def test_missing_and_null_task_type_replay_identically(policy_service):
+def test_missing_and_null_task_type_replay_identically(test_app, policy_service):
     service = policy_service(tenant={"max_input_bytes": 512})
-    with TestClient(main.app) as client:
+    with TestClient(test_app) as client:
         first = client.post("/chat", json=payload())
         replay = client.post("/chat", json={**payload(), "task_type": None})
     assert first.status_code == replay.status_code == 200

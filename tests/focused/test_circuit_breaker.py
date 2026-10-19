@@ -132,6 +132,7 @@ def stored_request(service, request_id):
 # Demonstrates that circuit rejection preserves a retryable record, rejects
 # changed input, and allows the original request to recover without duplication.
 def test_api_circuit_rejection_preserves_retryable_storage(
+    test_app,
     isolated_chat_service,
     breaker_clock,
 ):
@@ -166,7 +167,7 @@ def test_api_circuit_rejection_preserves_retryable_storage(
     complete = AsyncMock(side_effect=recover)
     service.primary_provider = SimpleNamespace(complete=complete)
 
-    with TestClient(main_module.app) as client:
+    with TestClient(test_app) as client:
         rejected = client.post("/chat", json=payload)
 
         assert rejected.status_code == 503
@@ -221,7 +222,9 @@ def test_api_circuit_rejection_preserves_retryable_storage(
 
 # Demonstrates that an uncertain circuit error stays unknown in storage
 # and repeating the request does not cause another generation attempt.
-def test_api_circuit_error_preserves_previous_uncertainty(isolated_chat_service):
+def test_api_circuit_error_preserves_previous_uncertainty(
+    test_app, isolated_chat_service
+):
     service = isolated_chat_service
     service.chat_rate_limiter = TenantRateLimiter(100, 60)
     service.generate = AsyncMock(
@@ -241,7 +244,7 @@ def test_api_circuit_error_preserves_previous_uncertainty(isolated_chat_service)
         "max_tokens": 10,
     }
 
-    with TestClient(main_module.app) as client:
+    with TestClient(test_app) as client:
         response = client.post("/chat", json=payload)
         saved = stored_request(service, payload["request_id"])
         assert saved["status"] == "unknown"

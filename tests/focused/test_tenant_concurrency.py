@@ -20,7 +20,6 @@ import httpx
 import pytest
 from fastapi import HTTPException, Request
 
-from model_bridge import main
 from model_bridge.providers.contracts import GenerationResult
 from model_bridge.config.loader import SETTINGS
 from model_bridge.execution.rate_limit import TenantRateLimiter
@@ -171,22 +170,22 @@ def test_invalid_tenant_allowance_is_rejected(tenant_limit):
 
 # Supplies deterministic tenant policies without depending on production config values.
 @pytest.fixture
-def tenant_api(monkeypatch, tmp_path):
+def tenant_api(test_app, monkeypatch, tmp_path):
     data = SETTINGS.model_dump()
     data["platform"]["max_concurrent_jobs_per_instance"] = 3
     data["tenant_defaults"]["max_concurrent_jobs"] = 2
     data["tenant_overrides"] = {"tenant-a": {"max_concurrent_jobs": 1}}
     settings = Settings.model_validate(data)
     monkeypatch.setattr(
-        main.app.state.chat_service, "settings", settings, raising=False
+        test_app.state.chat_service, "settings", settings, raising=False
     )
     monkeypatch.setattr(
-        main.app.state.chat_service,
+        test_app.state.chat_service,
         "request_store",
         RequestStore(tmp_path / "requests.sqlite3"),
     )
     monkeypatch.setattr(
-        main.app.state.chat_service, "chat_rate_limiter", TenantRateLimiter(100, 60)
+        test_app.state.chat_service, "chat_rate_limiter", TenantRateLimiter(100, 60)
     )
     generation = AsyncMock(
         return_value=GenerationResult(
@@ -196,12 +195,12 @@ def tenant_api(monkeypatch, tmp_path):
             provider="fake",
         )
     )
-    monkeypatch.setattr(main.app.state.chat_service, "generate", generation)
+    monkeypatch.setattr(test_app.state.chat_service, "generate", generation)
     return settings, generation
 
 
 # Replaces future authentication with trusted test identities; no real credentials are used.
-def configure_identity(monkeypatch):
+def configure_identity(monkeypatch, test_app):
     dependency = get_authenticated_tenant
     assert callable(dependency), "Wire a get_authenticated_tenant dependency into /chat"
 
@@ -213,7 +212,7 @@ def configure_identity(monkeypatch):
         return SimpleNamespace(id=tenant_id)
 
     monkeypatch.setitem(
-        main.app.dependency_overrides, dependency, authenticated_for_test
+        test_app.dependency_overrides, dependency, authenticated_for_test
     )
 
 
@@ -231,15 +230,15 @@ def payload(request_id, claimed_tenant):
 # Checks a configured override and the default allowance are enforced by the API.
 @pytest.mark.parametrize("tenant, expected_limit", [("tenant-a", 1), ("tenant-b", 2)])
 def test_api_resolves_authenticated_tenant_policy(
-    tenant_api, monkeypatch, tenant, expected_limit
+    test_app, tenant_api, monkeypatch, tenant, expected_limit
 ):
     settings, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
     monkeypatch.setattr(
-        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+        test_app.state.chat_service, "generation_limiter", limiter, raising=False
     )
-    configure_identity(monkeypatch)
+    configure_identity(monkeypatch, test_app)
     assert (
         settings.effective_tenant_limits(tenant).max_concurrent_jobs == expected_limit
     )
@@ -247,7 +246,7 @@ def test_api_resolves_authenticated_tenant_policy(
     # Fills only this tenant's allowance, verifies rejection, then retries the same ID.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app),
+            transport=httpx.ASGITransport(app=test_app),
             base_url="http://test",
         ) as client:
             with ExitStack() as held:
@@ -277,19 +276,19 @@ def test_api_resolves_authenticated_tenant_policy(
 
 
 # Checks changing body tenant metadata cannot bypass the authenticated tenant's ceiling.
-def test_body_tenant_spoofing_cannot_bypass_capacity(tenant_api, monkeypatch):
+def test_body_tenant_spoofing_cannot_bypass_capacity(test_app, tenant_api, monkeypatch):
     _, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
     monkeypatch.setattr(
-        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+        test_app.state.chat_service, "generation_limiter", limiter, raising=False
     )
-    configure_identity(monkeypatch)
+    configure_identity(monkeypatch, test_app)
 
     # Accepts either rejecting a mismatched identity or enforcing authenticated capacity.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app),
+            transport=httpx.ASGITransport(app=test_app),
             base_url="http://test",
         ) as client:
             with limiter.slot(tenant_id="tenant-a", tenant_limit=1):
@@ -313,14 +312,14 @@ def test_body_tenant_spoofing_cannot_bypass_capacity(tenant_api, monkeypatch):
 
 
 # Checks unauthenticated callers cannot obtain capacity by supplying a body tenant ID.
-def test_unauthenticated_request_does_not_generate(tenant_api, monkeypatch):
+def test_unauthenticated_request_does_not_generate(test_app, tenant_api, monkeypatch):
     _, generation = tenant_api
-    configure_identity(monkeypatch)
+    configure_identity(monkeypatch, test_app)
 
     # Sends a valid body without an authenticated identity and expects rejection.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app),
+            transport=httpx.ASGITransport(app=test_app),
             base_url="http://test",
         ) as client:
             response = await client.post("/chat", json=payload("anonymous", "tenant-a"))
@@ -331,19 +330,21 @@ def test_unauthenticated_request_does_not_generate(tenant_api, monkeypatch):
 
 
 # Checks same-tenant replay remains available with both platform and tenant slots full.
-def test_authenticated_cached_replay_bypasses_capacity(tenant_api, monkeypatch):
+def test_authenticated_cached_replay_bypasses_capacity(
+    test_app, tenant_api, monkeypatch
+):
     _, generation = tenant_api
     limiter_class, _ = limiter_types()
     limiter = limiter_class(3)
     monkeypatch.setattr(
-        main.app.state.chat_service, "generation_limiter", limiter, raising=False
+        test_app.state.chat_service, "generation_limiter", limiter, raising=False
     )
-    configure_identity(monkeypatch)
+    configure_identity(monkeypatch, test_app)
 
     # Saves a result and then replays it while every generation slot is occupied.
     async def scenario():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=main.app),
+            transport=httpx.ASGITransport(app=test_app),
             base_url="http://test",
         ) as client:
             headers = {"x-test-authenticated-tenant": "tenant-a"}
